@@ -1,218 +1,204 @@
 import Foundation
 
-/// Native Anthropic Messages API and any third-party server that speaks the same
-/// shape (custom-base-URL Anthropic-format proxies, self-hosted Claude, etc.).
-///
-/// Wire format: `POST {baseURL}/v1/messages`, headers `x-api-key` + `anthropic-version`,
-/// streaming via SSE with `event:` lines (`content_block_delta` carries text in
-/// `delta.text`).
 public struct AnthropicProvider: AIProvider {
     public let providerType: AIProviderType
+    public init(providerType: AIProviderType = .anthropic) { self.providerType = providerType }
 
-    public init(providerType: AIProviderType = .anthropic) {
-        self.providerType = providerType
-    }
-
-    public func stream(endpoint: EndpointConfig, apiKey: String?, messages: [ChatMessage]) -> AsyncThrowingStream<String, Error> {
+    public func stream(endpoint: EndpointConfig, apiKey: String?, messages: [ChatMessage]) -> AsyncThrowingStream<ProviderStreamEvent, Error> {
         AsyncThrowingStream { continuation in
+            let session = StreamingHTTP.session()
             let task = Task {
+                defer { session.invalidateAndCancel() }
                 do {
-                    try Task.checkCancellation()
-                    let request = try Self.buildRequest(endpoint: endpoint, apiKey: apiKey, messages: messages)
-                    let (bytes, _) = try await StreamingHTTP.send(request)
-
-                    var parser = SSEParser()
-                    for try await line in bytes.lines {
-                        if Task.isCancelled { break }
-                        guard let event = parser.feed(line: line) else { continue }
-                        if let text = Self.extractText(eventType: event.event, data: event.data) {
-                            if !text.isEmpty { continuation.yield(text) }
+                    var continuationBlocks: [[String: Any]] = []
+                    // Server tools can pause a turn; retain the original blocks, signatures and IDs.
+                    // Never turn a paused server exchange into fabricated plain-text messages.
+                    for turn in 0..<3 {
+                        try Task.checkCancellation()
+                        let request = try Self.buildRequest(endpoint: endpoint, apiKey: apiKey, messages: messages, continuationBlocks: continuationBlocks)
+                        let (bytes, _) = try await StreamingHTTP.send(request, session: session)
+                        var parser = SSEParser()
+                        var decoder = AnthropicStreamDecoder()
+                        for try await line in bytes.lines {
+                            try Task.checkCancellation()
+                            guard let event = parser.feed(line: line) else { continue }
+                            for value in try decoder.consume(event) { continuation.yield(value) }
+                            if decoder.stopped { break }
                         }
+                        if !decoder.stopped, let event = parser.flush() {
+                            for value in try decoder.consume(event) { continuation.yield(value) }
+                        }
+                        guard decoder.stopped else { throw APIError.incompleteStream }
+                        if decoder.stopReason == "pause_turn" {
+                            guard turn < 2, !decoder.contentBlocks.isEmpty else {
+                                throw APIError.server("Server tool continuation limit reached")
+                            }
+                            continuationBlocks += decoder.contentBlocks
+                            continue
+                        }
+                        guard decoder.completed else { throw APIError.incompleteStream }
+                        continuation.finish(); return
                     }
-                    if Task.isCancelled {
-                        continuation.finish(throwing: APIError.cancelled)
-                    } else {
-                        continuation.finish()
-                    }
-                } catch is CancellationError {
-                    continuation.finish(throwing: APIError.cancelled)
+                    throw APIError.incompleteStream
                 } catch {
-                    continuation.finish(throwing: error)
+                    let failure = APIError.from(error)
+                    continuation.finish(throwing: failure)
                 }
             }
-            continuation.onTermination = { _ in task.cancel() }
+            continuation.onTermination = { _ in task.cancel(); session.invalidateAndCancel() }
         }
     }
 
     public func listModels(endpoint: EndpointConfig, apiKey: String?) async throws -> [String] {
-        // Native Anthropic has no public models endpoint, so the curated
-        // Claude list is the best we can do there. This is the ONLY case
-        // where it's appropriate to surface Claude names — for any other
-        // provider we'd be lying about what the server offers.
-        guard endpoint.providerType == .anthropicCompatible || endpoint.providerType == .anthropic else {
-            return Self.defaultModelSuggestions
+        guard let url = endpoint.modelsURL() else { throw APIError.invalidURL(endpoint.baseURLString) }
+        guard endpoint.authentication != .chatGPT else { throw APIError.authentication }
+        var request = URLRequest(url: url)
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        for (name, value) in endpoint.customHeaders { request.setValue(value, forHTTPHeaderField: name) }
+        if let key = apiKey, !key.isEmpty {
+            request.setValue(key, forHTTPHeaderField: "x-api-key")
         }
-        // For Anthropic-compatible third-party servers (MiniMax, Cloudflare
-        // Workers AI, self-hosted gateways, …), probe a few common
-        // models-endpoint paths and return whatever the server actually
-        // answers with. We deliberately do NOT fall back to the Claude
-        // list here, because doing so silently replaces the server's
-        // catalog with Anthropic's — the user thinks they're seeing what
-        // their server offers when really they're seeing Claude names.
-        let base = endpoint.baseURL
-        guard let base else {
-            throw APIError.invalidURL(endpoint.baseURLString)
+        let session = StreamingHTTP.session()
+        defer { session.invalidateAndCancel() }
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw APIError.transport("Non-HTTP response") }
+        guard (200..<300).contains(http.statusCode) else {
+            throw APIError.response(status: http.statusCode, body: String(data: data, encoding: .utf8) ?? "")
         }
-        var lastError: Error?
-        // Probe paths are relative to the base URL. We try a few common
-        // shapes because Anthropic-compatible gateways disagree on whether
-        // the API root is the origin (e.g. https://api.minimaxi.com) or
-        // the origin with a /v1 prefix (e.g. https://api.minimaxi.com/v1).
-        // Using URL(string:relativeTo:) instead of appendingPathComponent
-        // avoids the doubled-path bug that bit MiniMax: with the old code,
-        // a base of https://api.minimaxi.com/v1 plus a candidate of
-        // "/v1/models" produced a request to /v1/v1/models — 404 every
-        // time — and the user was left guessing why the picker was empty.
-        let candidates = ["v1/models", "models"]
-        for path in candidates {
-            guard let url = URL(string: path, relativeTo: base)?.absoluteURL else { continue }
-            var request = URLRequest(url: url)
-            request.httpMethod = "GET"
-            request.setValue("application/json", forHTTPHeaderField: "Accept")
-            if let key = apiKey, !key.isEmpty {
-                request.setValue(key, forHTTPHeaderField: "x-api-key")
-                request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
-            }
-            do {
-                let models = try await Self.fetchModels(request: request)
-                if !models.isEmpty { return models }
-            } catch {
-                // Remember the first real error so the caller can show
-                // something useful (e.g. "HTTP 401") instead of a generic
-                // "no models returned".
-                lastError = error
-            }
-        }
-        if let lastError { throw lastError }
-        return []
+        return try OpenAIProvider.decodeModels(data)
     }
 
-    private static func fetchModels(request: URLRequest) async throws -> [String] {
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse else {
-            throw APIError.transport("Non-HTTP response from models endpoint")
-        }
-        if !(200..<300).contains(http.statusCode) {
-            // Surface the real status so the editor UI can tell the user
-            // *why* the probe failed (e.g. 401, 403, 404) instead of
-            // masking it as "no models returned".
-            let body = String(data: data, encoding: .utf8) ?? ""
-            throw APIError.http(status: http.statusCode, body: body)
-        }
-        // OpenAI-style { "data": [{ "id": "..." }] }
-        if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            if let arr = obj["data"] as? [[String: Any]] {
-                let ids = arr.compactMap { $0["id"] as? String }.sorted()
-                if !ids.isEmpty { return ids }
-            }
-            // Some gateways use { "models": [{ "name": "..." }] }
-            if let arr = obj["models"] as? [[String: Any]] {
-                let ids = arr.compactMap {
-                    ($0["name"] as? String) ?? ($0["id"] as? String)
-                }.sorted()
-                if !ids.isEmpty { return ids }
-            }
-        }
-        // 2xx with a body shape we don't recognise: not a hard error,
-        // just nothing to show. Returning [] lets the caller try the next
-        // candidate path.
-        return []
-    }
+    public static let defaultModelSuggestions = ["claude-3-5-sonnet-latest", "claude-3-5-haiku-latest"]
 
-    public static let defaultModelSuggestions: [String] = [
-        "claude-3-5-sonnet-latest",
-        "claude-3-5-haiku-latest",
-        "claude-3-opus-latest",
-        "claude-3-sonnet-20240229",
-        "claude-3-haiku-20240307"
-    ]
-
-    // MARK: - Request building
-
-    static func buildRequest(endpoint: EndpointConfig, apiKey: String?, messages: [ChatMessage]) throws -> URLRequest {
-        guard let url = endpoint.chatCompletionsURL() else {
-            throw APIError.invalidURL(endpoint.baseURLString)
-        }
+    static func buildRequest(endpoint: EndpointConfig, apiKey: String?, messages: [ChatMessage], continuationBlocks: [[String: Any]] = []) throws -> URLRequest {
+        guard let url = endpoint.chatCompletionsURL() else { throw APIError.invalidURL(endpoint.baseURLString) }
+        guard endpoint.authentication != .chatGPT else { throw APIError.authentication }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
-        if let key = apiKey, !key.isEmpty {
-            request.setValue(key, forHTTPHeaderField: "x-api-key")
-        }
         request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-        for (k, v) in endpoint.customHeaders {
-            request.setValue(v, forHTTPHeaderField: k)
+        for (name, value) in endpoint.customHeaders { request.setValue(value, forHTTPHeaderField: name) }
+        if let key = apiKey, !key.isEmpty { request.setValue(key, forHTTPHeaderField: "x-api-key") }
+        var history: [[String: Any]] = []
+        for message in messages where message.role != .system && !message.content.isEmpty {
+            let role = message.role.rawValue
+            // Anthropic merges adjacent same-role text turns; do it explicitly without invented replies.
+            if let last = history.last, last["role"] as? String == role, let text = last["content"] as? String {
+                history[history.count - 1]["content"] = text + "\n\n" + message.content
+            } else { history.append(["role": role, "content": message.content]) }
         }
-
-        var apiMessages: [AnthropicMessage] = []
-        let system = endpoint.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        for m in messages where m.role != .system {
-            apiMessages.append(.init(role: m.role.rawValue, content: m.content))
+        if !continuationBlocks.isEmpty { history.append(["role": "assistant", "content": continuationBlocks]) }
+        let system = ([endpoint.systemPrompt] + messages.filter { $0.role == .system }.map(\.content))
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.joined(separator: "\n\n")
+        var payload: [String: Any] = ["model": endpoint.model, "messages": history,
+                                      "max_tokens": endpoint.maxTokens ?? 2048, "temperature": endpoint.temperature, "stream": true]
+        if !system.isEmpty { payload["system"] = system }
+        if endpoint.searchMode == .auto {
+            payload["tools"] = [["type": "web_search_20250305", "name": "web_search", "max_uses": 3]]
         }
-
-        let payload = AnthropicRequest(
-            model: endpoint.model,
-            messages: apiMessages,
-            system: system.isEmpty ? nil : system,
-            maxTokens: endpoint.maxTokens ?? 1024,
-            temperature: endpoint.temperature,
-            stream: true
-        )
-        request.httpBody = try JSONEncoder().encode(payload)
+        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
         return request
     }
+}
 
-    // MARK: - Response parsing
+public struct AnthropicStreamDecoder {
+    public private(set) var stopped = false
+    public private(set) var completed = false
+    public private(set) var stopReason: String?
+    private var blocks: [Int: [String: Any]] = [:]
+    private var inputJSON: [Int: String] = [:]
+    private var citationIDs: Set<String> = []
+    private var searchStarted = false
+    public var contentBlocks: [[String: Any]] { blocks.keys.sorted().compactMap { blocks[$0] } }
+    public init() {}
 
-    static func extractText(eventType: String?, data: String) -> String? {
-        guard let eventType else { return nil }
-        guard let jsonData = data.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else {
-            return nil
+    public mutating func consume(_ event: SSEEvent) throws -> [ProviderStreamEvent] {
+        guard !stopped, !event.data.isEmpty else { return [] }
+        guard let data = event.data.data(using: .utf8), let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw APIError.decoding("Malformed stream event")
         }
-        switch eventType {
-        case "content_block_delta":
-            if let delta = obj["delta"] as? [String: Any],
-               delta["type"] as? String == "text_delta",
-               let text = delta["text"] as? String {
-                return text
+        let type = obj["type"] as? String ?? event.event ?? ""
+        let index = obj["index"] as? Int ?? 0
+        var out: [ProviderStreamEvent] = []
+        switch type {
+        case "error": throw OpenAIStreamDecoder.streamError(obj)
+        case "content_block_start":
+            if let block = obj["content_block"] as? [String: Any] {
+                blocks[index] = block
+                if block["type"] as? String == "text", let text = block["text"] as? String, !text.isEmpty { out.append(.text(text)) }
+                if block["type"] as? String == "server_tool_use", block["name"] as? String == "web_search" { startSearch(to: &out) }
+                if block["type"] as? String == "web_search_tool_result" { try searchResult(block, to: &out) }
+                for citation in block["citations"] as? [[String: Any]] ?? [] { appendCitation(citation, to: &out) }
             }
-        case "message_start", "message_delta", "message_stop",
-             "content_block_start", "content_block_stop", "ping":
-            return nil
-        default:
-            return nil
+        case "content_block_delta":
+            guard let delta = obj["delta"] as? [String: Any] else { break }
+            switch delta["type"] as? String {
+            case "text_delta":
+                if let text = delta["text"] as? String {
+                    let prior = blocks[index]?["text"] as? String ?? ""
+                    blocks[index, default: ["type": "text"]]["text"] = prior + text
+                    if !text.isEmpty { out.append(.text(text)) }
+                }
+            case "input_json_delta":
+                inputJSON[index, default: ""] += delta["partial_json"] as? String ?? ""
+            case "citations_delta":
+                if let citation = delta["citation"] as? [String: Any] {
+                    var citations = blocks[index]?["citations"] as? [[String: Any]] ?? []
+                    citations.append(citation); blocks[index, default: [:]]["citations"] = citations
+                    appendCitation(citation, to: &out)
+                }
+            case "thinking_delta":
+                let prior = blocks[index]?["thinking"] as? String ?? ""
+                blocks[index, default: [:]]["thinking"] = prior + (delta["thinking"] as? String ?? "")
+            case "signature_delta":
+                let prior = blocks[index]?["signature"] as? String ?? ""
+                blocks[index, default: [:]]["signature"] = prior + (delta["signature"] as? String ?? "")
+            default: break
+            }
+        case "content_block_stop":
+            if let json = inputJSON.removeValue(forKey: index), let data = json.data(using: .utf8),
+               let value = try? JSONSerialization.jsonObject(with: data) {
+                blocks[index, default: [:]]["input"] = value
+            }
+        case "message_delta":
+            if let delta = obj["delta"] as? [String: Any] { stopReason = delta["stop_reason"] as? String }
+        case "message_stop":
+            stopped = true
+            if stopReason == "pause_turn" { break }
+            guard let reason = stopReason else { throw APIError.incompleteStream }
+            if reason == "max_tokens" { throw APIError.incompleteStream }
+            if reason == "tool_use" { throw APIError.unsupportedInteraction("This response requires an unconfigured client tool.") }
+            guard ["end_turn", "stop_sequence", "refusal"].contains(reason) else { throw APIError.incompleteStream }
+            completed = true; out.append(.completed)
+        default: break
         }
-        return nil
+        return out
     }
-}
 
-private struct AnthropicRequest: Encodable {
-    let model: String
-    let messages: [AnthropicMessage]
-    let system: String?
-    let maxTokens: Int
-    let temperature: Double
-    let stream: Bool
-
-    enum CodingKeys: String, CodingKey {
-        case model, messages, system, temperature, stream
-        case maxTokens = "max_tokens"
+    private mutating func startSearch(to out: inout [ProviderStreamEvent]) {
+        if !searchStarted { searchStarted = true; out.append(.searchActivity(.searching)) }
     }
-}
-
-private struct AnthropicMessage: Encodable {
-    let role: String
-    let content: String
+    private mutating func searchResult(_ block: [String: Any], to out: inout [ProviderStreamEvent]) throws {
+        startSearch(to: &out)
+        if let error = block["content"] as? [String: Any], error["type"] as? String == "web_search_tool_result_error" {
+            let code = error["error_code"] as? String ?? ""
+            if ["unsupported_tool", "tool_not_supported"].contains(code) {
+                throw APIError.unsupportedTool("Live search is unavailable for this connection and model.")
+            }
+            if code == "too_many_requests" { throw APIError.quota }
+            throw APIError.server("Live search failed")
+        }
+        guard let results = block["content"] as? [[String: Any]] else { throw APIError.decoding("Search result") }
+        for result in results { appendCitation(result, to: &out) }
+        out.append(.searchActivity(.completed))
+    }
+    private mutating func appendCitation(_ value: [String: Any], to out: inout [ProviderStreamEvent]) {
+        guard let url = value["url"] as? String else { return }
+        let citation = SourceCitation(url: url, title: value["title"] as? String ?? URL(string: url)?.host ?? url,
+                                      excerpt: value["cited_text"] as? String)
+        guard citation.safeURL != nil, citationIDs.insert(citation.id).inserted else { return }
+        out.append(.citation(citation))
+    }
 }

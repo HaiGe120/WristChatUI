@@ -80,6 +80,14 @@ struct SettingsView: View {
                             .foregroundStyle(isFailureStatus(backupStatus) ? .red : .secondary)
                     }
                 }
+                Section("Web search") {
+                    NavigationLink("Search sources") { SearchSourcesView() }
+                }
+                #if DEBUG
+                Section("Development") {
+                    NavigationLink("ChatGPT account") { ChatGPTAccountView() }
+                }
+                #endif
                 Section("Endpoints") {
                     if endpoints.endpoints.isEmpty {
                         Text("No endpoints yet. Tap + to add one.")
@@ -120,6 +128,7 @@ struct SettingsView: View {
                 }
                 Section("About") {
                     LabeledContent("Version", value: appVersion)
+                    NavigationLink("Privacy & search") { SearchPrivacyView() }
                     Link("Open WebUI", destination: URL(string: "https://openwebui.com")!)
                     Link("Chat API reference (OpenAI format)", destination: URL(string: "https://platform.openai.com/docs/api-reference/chat")!)
                     Link("Chat API reference (Anthropic format)", destination: URL(string: "https://docs.anthropic.com/en/api/messages")!)

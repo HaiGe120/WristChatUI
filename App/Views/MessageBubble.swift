@@ -37,12 +37,17 @@ struct MessageBubble: View {
         HStack {
             if isUser { Spacer(minLength: 40) }
             VStack(alignment: isUser ? .trailing : .leading, spacing: 4) {
-                MarkdownText(raw: displayContent, enablesSelection: true)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
-                    .background(isUser ? Color.accentColor : assistantBackground)
-                    .foregroundStyle(isUser ? .white : .primary)
-                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                if !displayContent.isEmpty || message.responseMetadata?.phase.isActive != false {
+                    MarkdownText(raw: CitedAnswer.markdown(displayContent, citations: message.responseMetadata?.citations ?? [], restrictLinksToSources: message.responseMetadata?.searchSource != nil), enablesSelection: true)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 10)
+                        .background(isUser ? Color.accentColor : assistantBackground)
+                        .foregroundStyle(isUser ? .white : .primary)
+                        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                }
+                if let metadata = message.responseMetadata {
+                    ResponseDetailsView(metadata: metadata, content: displayContent)
+                }
                 Text(message.createdAt, style: .time)
                     .font(.caption2)
                     .foregroundStyle(.secondary)

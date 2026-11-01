@@ -10,11 +10,14 @@ private let chatLog = Logger(subsystem: "com.wristassistant.app.watchkitapp", ca
 
 struct ChatView: View {
     @Environment(\.modelContext) private var modelContext
+    @Environment(\.scenePhase) private var scenePhase
     @EnvironmentObject private var endpoints: EndpointStore
     @Bindable var conversation: Conversation
     let focusComposerOnAppear: Bool
 
     @StateObject private var engine = ChatEngine()
+    @ObservedObject private var searchSources = SearchSourceStore.shared
+    @State private var searchEnabled = false
     @State private var draft: String = ""
     @State private var lastError: String?
     /// Live buffer of the assistant's in-progress reply. Mirrors the
@@ -57,14 +60,20 @@ struct ChatView: View {
                 EndpointPickerSheet(conversation: conversation)
             }
         }
-        .alert("Error", isPresented: .init(
-            get: { lastError != nil },
-            set: { if !$0 { lastError = nil } }
-        )) {
-            Button("OK", role: .cancel) { lastError = nil }
-        } message: {
-            Text(lastError ?? "")
+        .onAppear {
+            searchEnabled = endpoint?.searchMode == .auto
+            if !engine.isStreaming { ConversationRequest.reconcileInterrupted(conversation, context: modelContext) }
         }
+        .onChange(of: conversation.endpointID) { _, _ in
+            engine.cancel()
+            searchEnabled = endpoint?.searchMode == .auto
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { engine.reconcileAfterForeground() }
+            else { try? modelContext.save() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: SearchSourceStore.didChange)) { _ in engine.cancel() }
+        .onDisappear { engine.cancel() }
     }
 
     /// The composer is the final scroll item, matching Apple Watch
@@ -80,14 +89,32 @@ struct ChatView: View {
                             streamingOverride: streamingOverride(for: message)
                         )
                         .id(message.id)
+                        if let metadata = message.responseMetadata,
+                           [.failed, .partial, .cancelled].contains(metadata.phase) {
+                            Button("Retry") { start(retry: message) }
+                                .font(.caption)
+                                .disabled(engine.isStreaming)
+                            if ["timeout", "offline", "connectionLost", "incomplete"].contains(metadata.errorCode ?? "") {
+                                NavigationLink("Connection help") { WatchConnectionHelpView() }
+                                    .font(.caption2)
+                            }
+                        }
                     }
 
+                    Toggle("Search · \(searchSources.selectedSource?.name ?? "Native")", isOn: $searchEnabled)
+                        .font(.caption2)
+                        .disabled(engine.isStreaming)
+                    if engine.isStreaming {
+                        Text(engine.metadata?.statusText ?? "Connecting…")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
                     ComposerView(
                         text: $draft,
                         isStreaming: engine.isStreaming,
                         canSend: canSend,
                         focusTrigger: focusComposerTrigger,
                         onSend: { send() },
+                        onStop: { engine.cancel() },
                         onSubmitText: { send($0) }
                     )
                     .id(composerID)
@@ -128,50 +155,30 @@ struct ChatView: View {
     /// assistant message while the engine is producing deltas.
     private func streamingOverride(for message: Message) -> String? {
         guard engine.isStreaming, message.role == .assistant else { return nil }
-        guard let lastAssistant = conversation.sortedMessages.last(where: { $0.role == .assistant }) else {
-            return nil
-        }
-        guard lastAssistant.id == message.id else { return nil }
+        guard let attemptID = engine.metadata?.attemptID,
+              message.responseMetadata?.attemptID == attemptID else { return nil }
         return streamingContent
     }
 
     private func send(_ submittedText: String? = nil) {
-        if engine.isStreaming {
-            engine.cancel()
-            return
-        }
-        let userText = (submittedText ?? draft).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !userText.isEmpty, let endpoint else { return }
+        if let submittedText { draft = submittedText }
+        guard !engine.isStreaming else { return }
+        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
         draft = ""
-        streamingContent = ""
-
-        let apiKey = endpoints.apiKey(for: endpoint.id)
-        let userMessage = Message(role: .user, content: userText, orderIndex: conversation.messages.count, conversation: conversation)
-        let assistantMessage = Message(role: .assistant, content: "", orderIndex: conversation.messages.count + 1, conversation: conversation)
-        modelContext.insert(userMessage)
-        modelContext.insert(assistantMessage)
-        conversation.updatedAt = .now
-        if conversation.title == "New chat" {
-            conversation.title = userText.prefix(40).description
-        }
-
-        let history = conversation.sortedMessages
-            .filter { $0.role != .system }
-            .map { ChatMessage(role: $0.role, content: $0.content) }
-
-        engine.send(endpoint: endpoint, apiKey: apiKey, messages: history) { delta in
-            streamingContent += delta
-        } onComplete: {
-            let final = streamingContent
-            assistantMessage.content = final
-            if final.isEmpty, let err = engine.lastError {
-                assistantMessage.content = "⚠️ \(err)"
-            }
-            streamingContent = ""
-            try? modelContext.save()
-            SyncCoordinator.shared.publishConversation(ConversationSnapshot(conversation))
-        }
+        start(text: text)
     }
+
+    private func start(text: String? = nil, retry: Message? = nil) {
+        guard !engine.isStreaming, let endpoint else { return }
+        streamingContent = ""
+        ConversationRequest.start(engine: engine, conversation: conversation, context: modelContext,
+                                  endpoint: endpoint, apiKey: endpoints.apiKey(for: endpoint.id),
+                                  userText: text, retry: retry, searchEnabled: searchEnabled,
+                                  onDelta: { streamingContent += $0 },
+                                  onComplete: { streamingContent = "" })
+    }
+
 }
 
 private struct WatchMessageRow: View {
@@ -191,14 +198,20 @@ private struct WatchMessageRow: View {
         HStack(alignment: .top) {
             if isUser { Spacer(minLength: 24) }
             VStack(alignment: isUser ? .trailing : .leading, spacing: 2) {
-                MarkdownText(raw: displayContent)
-                    .font(.body)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 6)
-                    .background(isUser ? Color.accentColor : Color.gray.opacity(0.25))
-                    .foregroundStyle(isUser ? .white : .primary)
-                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                    .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
+                if !displayContent.isEmpty || message.responseMetadata?.phase.isActive != false {
+                    MarkdownText(raw: CitedAnswer.markdown(displayContent, citations: message.responseMetadata?.citations ?? [], restrictLinksToSources: message.responseMetadata?.searchSource != nil))
+                        .font(.body)
+                        .lineSpacing(2)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
+                        .background(isUser ? Color.accentColor : Color.gray.opacity(0.25))
+                        .foregroundStyle(isUser ? .white : .primary)
+                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
+                }
+                if let metadata = message.responseMetadata {
+                    ResponseDetailsView(metadata: metadata, content: displayContent)
+                }
             }
             if !isUser { Spacer(minLength: 24) }
         }

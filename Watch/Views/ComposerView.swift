@@ -15,6 +15,7 @@ struct ComposerView: View {
     let canSend: Bool
     let focusTrigger: Int
     let onSend: () -> Void
+    let onStop: () -> Void
     let onSubmitText: (String) -> Void
 
     @State private var isPresentingTextInput = false
@@ -62,7 +63,7 @@ struct ComposerView: View {
     private var sendButton: some View {
         Button {
             composerLog.info("send tapped (canSend=\(self.canSend, privacy: .public), isStreaming=\(self.isStreaming, privacy: .public))")
-            onSend()
+            if isStreaming { onStop() } else { onSend() }
         } label: {
             Image(systemName: isStreaming ? "stop.fill" : "arrow.up")
                 .font(.system(size: 13, weight: .bold))
@@ -76,7 +77,7 @@ struct ComposerView: View {
         .accessibilityLabel(isStreaming ? "Stop response" : "Send message")
         .accessibilityAction(.magicTap) {
             if isStreaming || canSend {
-                onSend()
+                if isStreaming { onStop() } else { onSend() }
             }
         }
         .handGestureShortcut(.primaryAction, isEnabled: isStreaming || canSend)

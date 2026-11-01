@@ -55,6 +55,7 @@ public final class SyncCoordinator: NSObject, ObservableObject {
 
     private var hasActivated = false
     private weak var sessionDelegate: AnyObject?
+    private var searchObserver: NSObjectProtocol?
 
     /// Set by the entry point (iPhone) on launch and by the user's
     /// "Sync now" action. Tells the coordinator to (re)publish the
@@ -69,6 +70,11 @@ public final class SyncCoordinator: NSObject, ObservableObject {
 
     private override init() {
         super.init()
+        #if os(iOS)
+        searchObserver = NotificationCenter.default.addObserver(forName: SearchSourceStore.didChange, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.publishSearchSources() }
+        }
+        #endif
     }
 
     /// Wire up `WCSession` and become the delegate. Safe to call multiple
@@ -133,6 +139,7 @@ public final class SyncCoordinator: NSObject, ObservableObject {
             // the previous per-key transferUserInfo loop, which the
             // user reported as not delivering to the watch.
             pushAllAPIKeys()
+            publishSearchSources()
             let context = DataStore.shared.mainContext
             let descriptor = FetchDescriptor<Conversation>(
                 sortBy: [SortDescriptor(\.updatedAt, order: .reverse)]
@@ -149,6 +156,7 @@ public final class SyncCoordinator: NSObject, ObservableObject {
             // "Sync now" later.
             requestEndpoints()
             requestConversations()
+            requestSearchSources()
         }
         #endif
     }
@@ -185,6 +193,26 @@ public final class SyncCoordinator: NSObject, ObservableObject {
         if session.activationState == .activated {
             transferUserInfo(kind: .endpoints, payload: payload)
         }
+        #endif
+    }
+
+    /// Separate provisioning path: search secrets never travel as chat-provider API keys.
+    public func publishSearchSources() {
+        #if os(iOS) && canImport(WatchConnectivity)
+        guard isSupported, WCSession.default.activationState == .activated else { return }
+        transferUserInfo(kind: .searchSources, payload: SearchSourceStore.shared.companionPayload())
+        #endif
+    }
+
+    public func requestSearchSources() {
+        #if os(watchOS) && canImport(WatchConnectivity)
+        guard isSupported, WCSession.default.activationState == .activated,
+              WCSession.default.isReachable else { return }
+        WCSession.default.sendMessage([SyncMessageKey.kind: SyncMessageKind.requestSearchSources.rawValue], replyHandler: { [weak self] reply in
+            Task { @MainActor in self?.handle(kind: .searchSources, raw: reply) }
+        }, errorHandler: { [weak self] _ in
+            Task { @MainActor in self?.lastError = "Reconnect to iPhone to provision search sources." }
+        })
         #endif
     }
 
@@ -542,6 +570,9 @@ extension SyncCoordinator: @preconcurrency WCSessionDelegate {
             // The companion just became reachable — if we tried to
             // bootstrap while it was offline, retry now.
             self.flushPendingBootstrapIfReady()
+            #if os(watchOS)
+            if session.isReachable { self.requestSearchSources() }
+            #endif
         }
     }
 
@@ -569,6 +600,16 @@ extension SyncCoordinator: @preconcurrency WCSessionDelegate {
         guard let kindRaw = message[SyncMessageKey.kind] as? String,
               let kind = SyncMessageKind(rawValue: kindRaw) else {
             replyHandler([:])
+            return
+        }
+        if kind == .requestSearchSources {
+            #if os(iOS)
+            if let data = try? Self.encoder.encode(SearchSourceStore.shared.companionPayload()) {
+                replyHandler([SyncMessageKey.kind: SyncMessageKind.searchSources.rawValue, SyncMessageKey.payload: data])
+            } else { replyHandler([:]) }
+            #else
+            replyHandler([:])
+            #endif
             return
         }
         // For requestEndpoints, reply with endpoints + keys in a
@@ -723,6 +764,13 @@ extension SyncCoordinator: @preconcurrency WCSessionDelegate {
         Task { @MainActor in
             do {
                 switch kind {
+                case .searchSources:
+                    #if os(watchOS)
+                    let payload = try Self.decoder.decode(SearchSourceCompanionPayload.self, from: payloadData)
+                    try SearchSourceStore.shared.applyCompanionPayload(payload)
+                    #endif
+                case .requestSearchSources:
+                    break
                 case .endpoints:
                     let payload = try Self.decoder.decode(EndpointsPayload.self, from: payloadData)
                     // Defense in depth: never apply a catalog wipe from
@@ -788,7 +836,9 @@ extension SyncCoordinator: @preconcurrency WCSessionDelegate {
 /// so the four inbound paths (apiKey, apiKeys, endpointsAndKeys, and
 /// the same set decoded from a legacy transferUserInfo) all share the
 /// same write semantics — including the empty-value "clear key" case.
+@MainActor
 private func applyAPIKeyPayload(_ payload: APIKeyPayload) {
+    guard EndpointStore.shared.endpoints.first(where: { $0.id == payload.endpointID })?.authentication != .chatGPT else { return }
     let account = "\(payload.endpointID.uuidString).apikey"
     if payload.value.isEmpty {
         KeychainStore.delete(account)
@@ -806,6 +856,8 @@ public enum SyncMessageKey {
 }
 
 public enum SyncMessageKind: String, Codable, Sendable {
+    case searchSources
+    case requestSearchSources
     case endpoints
     case apiKey
     case apiKeys
@@ -904,6 +956,7 @@ public struct MessageSnapshot: Codable, Sendable {
     var content: String
     var createdAt: Date
     var orderIndex: Int
+    var responseMetadata: ResponseMetadata?
 
     init(_ message: Message) {
         self.id = message.id
@@ -911,6 +964,7 @@ public struct MessageSnapshot: Codable, Sendable {
         self.content = message.content
         self.createdAt = message.createdAt
         self.orderIndex = message.orderIndex
+        self.responseMetadata = message.responseMetadata
     }
 }
 

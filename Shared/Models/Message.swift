@@ -8,6 +8,7 @@ public final class Message {
     public var content: String
     public var createdAt: Date
     public var orderIndex: Int
+    public var responseMetadataData: Data? = nil
 
     public var conversation: Conversation?
 
@@ -25,6 +26,11 @@ public final class Message {
         self.createdAt = createdAt
         self.orderIndex = orderIndex
         self.conversation = conversation
+    }
+
+    public var responseMetadata: ResponseMetadata? {
+        get { responseMetadataData.flatMap { try? JSONDecoder().decode(ResponseMetadata.self, from: $0) } }
+        set { responseMetadataData = newValue.flatMap { try? JSONEncoder().encode($0) } }
     }
 
     public var role: MessageRole {

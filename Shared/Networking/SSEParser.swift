@@ -59,7 +59,7 @@ public struct SSEParser {
 
     /// Flush the current accumulated event. Returns nil if nothing
     /// has been accumulated.
-    private mutating func flush() -> SSEEvent? {
+    public mutating func flush() -> SSEEvent? {
         defer {
             currentEvent = nil
             currentData = ""

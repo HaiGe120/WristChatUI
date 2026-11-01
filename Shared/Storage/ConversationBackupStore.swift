@@ -7,7 +7,7 @@ public enum ConversationBackupStore {
     @MainActor
     public static func writeBackup(for conversations: [Conversation]) throws -> ConversationBackupResult {
         let payload = ConversationBackupPayload(
-            schemaVersion: 1,
+            schemaVersion: 2,
             exportedAt: Date(),
             appName: "WristChat",
             appVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0",

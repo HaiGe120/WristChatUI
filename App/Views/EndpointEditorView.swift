@@ -6,7 +6,8 @@ struct EndpointEditorView: View {
 
     @State private var id: UUID = UUID()
     @State private var name: String = ""
-    @State private var providerType: AIProviderType = .openAICompatible
+    @State private var apiFormat: APIFormat = .chatCompletions
+    @State private var searchMode: SearchMode = .off
     @State private var baseURLString: String = ""
     @State private var model: String = ""
     @State private var systemPrompt: String = ""
@@ -29,7 +30,8 @@ struct EndpointEditorView: View {
         // so the picker — which only offers the two compat cases — has a
         // matching tag for the current selection. On save, the migrated
         // type is what gets persisted.
-        _providerType = State(initialValue: (endpoint?.providerType ?? .openAICompatible).migrated)
+        _apiFormat = State(initialValue: endpoint?.apiFormat ?? .chatCompletions)
+        _searchMode = State(initialValue: endpoint?.searchMode ?? .off)
         _baseURLString = State(initialValue: endpoint?.baseURLString ?? "")
         _model = State(initialValue: endpoint?.model ?? "")
         _systemPrompt = State(initialValue: endpoint?.systemPrompt ?? "")
@@ -41,12 +43,12 @@ struct EndpointEditorView: View {
         Form {
             Section("Profile") {
                 TextField("Name (e.g. My Open WebUI)", text: $name)
-                Picker("Provider", selection: $providerType) {
-                    ForEach(AIProviderType.pickerCases, id: \.self) { type in
+                Picker("API format", selection: $apiFormat) {
+                    ForEach(APIFormat.allCases, id: \.self) { type in
                         Text(type.displayName).tag(type)
                     }
                 }
-                .onChange(of: providerType) { _, _ in
+                .onChange(of: apiFormat) { _, _ in
                     // No more auto-filled base URL: every endpoint now
                     // requires the user to type the URL. We still clear
                     // any server-fetched model list because the model
@@ -101,6 +103,22 @@ struct EndpointEditorView: View {
                     Text("An API key is saved. Leave blank to keep it.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                }
+            }
+            Section("Web search") {
+                Picker("Default", selection: $searchMode) {
+                    Text("Off").tag(SearchMode.off)
+                    Text("Auto").tag(SearchMode.auto)
+                }
+                Text("Auto lets a supported model use native search. A separate selected search source retrieves references before the model answers. Search availability depends on this connection and model.")
+                    .font(.caption).foregroundStyle(.secondary)
+                if apiFormat == .chatCompletions {
+                    Text("Generic Chat Completions does not establish native search support. Choose a search source in Settings or use a verified Responses/Messages connection.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Button("Recheck native search on next question") {
+                    NativeSearchCapabilities.shared.clear(for: configuredEndpoint)
+                    testResult = "Native search will be checked on your next question with Web search enabled."
                 }
             }
             Section("Behavior") {
@@ -170,6 +188,26 @@ struct EndpointEditorView: View {
         }
     }
 
+    private var providerType: AIProviderType {
+        apiFormat == .anthropicMessages ? .anthropicCompatible : .openAICompatible
+    }
+
+    private var configuredEndpoint: EndpointConfig {
+        var config = existing ?? EndpointConfig(name: name, providerType: providerType,
+                                                 baseURLString: baseURLString, model: model)
+        config.id = id
+        config.name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        config.providerType = providerType
+        config.apiFormat = apiFormat
+        config.authentication = .apiKey
+        config.searchMode = searchMode
+        config.baseURLString = baseURLString.trimmingCharacters(in: .whitespacesAndNewlines)
+        config.model = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        config.systemPrompt = systemPrompt
+        config.temperature = temperature
+        return config
+    }
+
     private var apiKeyPlaceholder: String {
         switch providerType {
         case .openAI, .openAICompatible: return "API key (sk-…, or leave blank for local servers)"
@@ -178,31 +216,13 @@ struct EndpointEditorView: View {
     }
 
     private func save() {
-        let trimmedURL = baseURLString.trimmingCharacters(in: .whitespacesAndNewlines)
-        let config = EndpointConfig(
-            id: id,
-            name: name.trimmingCharacters(in: .whitespacesAndNewlines),
-            providerType: providerType,
-            baseURLString: trimmedURL,
-            model: model.trimmingCharacters(in: .whitespacesAndNewlines),
-            systemPrompt: systemPrompt,
-            temperature: temperature
-        )
+        let config = configuredEndpoint
         endpoints.save(config)
         if !apiKey.isEmpty {
             endpoints.setAPIKey(apiKey, for: id)
         } else if isNew {
             endpoints.setAPIKey("", for: id)
         }
-        #if DEBUG
-        // Diagnostics for the "API key doesn't survive a save" bug. Logs
-        // go to Xcode console; in the sim they're visible via
-        // `xcrun simctl spawn ... log stream` or the Console.app UI.
-        // Read AFTER the keychain write so the log reflects the
-        // post-save state, not the pre-save state.
-        let persistedKey = endpoints.apiKey(for: id) ?? "<nil>"
-        print("[WristAssistant] save: id=\(id) apiKeyTyped=\(apiKey.isEmpty ? "<empty>" : "<len \(apiKey.count)>") persistedKeyAfterSave=\(persistedKey.isEmpty ? "<empty>" : "<len \(persistedKey.count)>")")
-        #endif
         if endpoints.activeEndpointID == nil {
             endpoints.setActive(id)
         }
@@ -214,22 +234,9 @@ struct EndpointEditorView: View {
         fetchedModels = []
         useCustomModel = false
         isTestingConnection = true
-        let testEndpoint = EndpointConfig(
-            id: id,
-            name: name,
-            providerType: providerType,
-            baseURLString: baseURLString,
-            model: model,
-            systemPrompt: systemPrompt,
-            temperature: temperature
-        )
+        let testEndpoint = configuredEndpoint
         let key = apiKey.isEmpty ? endpoints.apiKey(for: id) : apiKey
-        #if DEBUG
-        let resolvedURL = testEndpoint.baseURL?.absoluteString ?? "<nil baseURL>"
-        let composedURL = (URL(string: "models", relativeTo: testEndpoint.baseURL)?.absoluteURL.absoluteString) ?? "<nil>"
-        print("[WristAssistant] test: id=\(id) providerType=\(providerType) baseURLString=\(testEndpoint.baseURLString) trimmedBaseURL=\(resolvedURL) composedModelsURL=\(composedURL) keySource=\(apiKey.isEmpty ? "keychain" : "form") keyLen=\(key?.count ?? 0)")
-        #endif
-        let provider = ProviderRegistry.provider(for: providerType)
+        let provider = ProviderRegistry.provider(for: testEndpoint)
         Task {
             do {
                 let models = try await provider.listModels(endpoint: testEndpoint, apiKey: key)

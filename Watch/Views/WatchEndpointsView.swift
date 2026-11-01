@@ -35,6 +35,9 @@ struct WatchEndpointsView: View {
                     }
                     .buttonStyle(.borderless)
                 }
+                NavigationLink("Connection help") {
+                    WatchConnectionHelpView()
+                }
             }
             Section("Configured") {
                 if endpoints.endpoints.isEmpty {
@@ -97,62 +100,85 @@ struct WatchEndpointEditor: View {
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var endpoints: EndpointStore
 
-    @State private var id: UUID = UUID()
-    @State private var name: String = ""
-    @State private var providerType: AIProviderType = .openAICompatible
-    @State private var baseURLString: String = ""
-    @State private var model: String = ""
-    @State private var systemPrompt: String = ""
-    @State private var temperature: Double = 0.7
-    @State private var apiKey: String = ""
-    @State private var hasExistingKey: Bool = false
-    @State private var isNew: Bool = true
+    private let original: EndpointConfig
+    private let isNew: Bool
+    @State private var edit: EndpointProfileEdit
+    @State private var apiKey = ""
+    @State private var hasExistingKey = false
+    @State private var saveError: String?
 
     init(endpoint: EndpointConfig?) {
-        _id = State(initialValue: endpoint?.id ?? UUID())
-        _name = State(initialValue: endpoint?.name ?? "")
-        _providerType = State(initialValue: endpoint?.providerType ?? .openAICompatible)
-        _baseURLString = State(initialValue: endpoint?.baseURLString ?? "")
-        _model = State(initialValue: endpoint?.model ?? "")
-        _systemPrompt = State(initialValue: endpoint?.systemPrompt ?? "")
-        _temperature = State(initialValue: endpoint?.temperature ?? 0.7)
-        _isNew = State(initialValue: endpoint == nil)
+        let source = endpoint ?? EndpointConfig(name: "", providerType: .openAICompatible,
+                                                baseURLString: "", model: "")
+        original = source
+        isNew = endpoint == nil
+        _edit = State(initialValue: EndpointProfileEdit(source))
     }
+
+    private var currentEndpoint: EndpointConfig {
+        endpoints.endpoints.first(where: { $0.id == original.id }) ?? original
+    }
+
+    private var isAccountConnection: Bool { currentEndpoint.authentication != .apiKey }
 
     var body: some View {
         Form {
-            Section("Profile") {
-                TextField("Name", text: $name)
-                Picker("Provider", selection: $providerType) {
-                    ForEach(AIProviderType.allCases) { type in
-                        Text(shortName(type)).tag(type)
+            if isAccountConnection {
+                Section {
+                    Label("ChatGPT account", systemImage: "person.crop.circle")
+                    Text("Manage this account on iPhone. Direct ChatGPT sign-in is still in development.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            } else {
+                Section("Profile") {
+                    TextField("Name", text: $edit.name)
+                    Picker("API format", selection: $edit.apiFormat) {
+                        ForEach(APIFormat.allCases) { format in
+                            Text(format.displayName).tag(format)
+                        }
                     }
                 }
-            }
-            Section("Connection") {
-                TextField("Base URL", text: $baseURLString)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                TextField("Model", text: $model)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                SecureField(apiKeyPlaceholder, text: $apiKey)
-                if hasExistingKey && apiKey.isEmpty {
-                    Text("Saved key on file. Leave blank to keep.")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+                Section {
+                    TextField("Base URL", text: $edit.baseURLString)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    TextField("Model", text: $edit.model)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    SecureField("API key (optional)", text: $apiKey)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    if hasExistingKey && apiKey.isEmpty {
+                        Text("Saved key on file. Leave blank to keep.")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                } header: {
+                    Text("Connection")
+                } footer: {
+                    Text("Requests run from Apple Watch. watchOS chooses the network route.")
+                }
+                Section("Web search") {
+                    Picker("Default", selection: $edit.searchMode) {
+                        Text("Off").tag(SearchMode.off)
+                        Text("Auto").tag(SearchMode.auto)
+                    }
+                    Text("Auto uses the selected search source. Native search depends on this connection and model.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+                Section("Behavior") {
+                    TextField("System prompt", text: $edit.systemPrompt, axis: .vertical)
+                        .lineLimit(1...3)
+                    HStack {
+                        Text("Temp")
+                        Spacer()
+                        Text(String(format: "%.2f", edit.temperature))
+                            .foregroundStyle(.secondary)
+                    }
+                    Slider(value: $edit.temperature, in: 0...2, step: 0.1)
                 }
             }
-            Section("Behavior") {
-                TextField("System prompt", text: $systemPrompt, axis: .vertical)
-                    .lineLimit(1...3)
-                HStack {
-                    Text("Temp")
-                    Spacer()
-                    Text(String(format: "%.2f", temperature))
-                        .foregroundStyle(.secondary)
-                }
-                Slider(value: $temperature, in: 0...2, step: 0.1)
+            if let saveError {
+                Text(saveError).font(.caption2).foregroundStyle(.red)
             }
         }
         .navigationTitle(isNew ? "New Endpoint" : "Edit Endpoint")
@@ -161,56 +187,33 @@ struct WatchEndpointEditor: View {
                 Button("Cancel") { dismiss() }
             }
             ToolbarItem(placement: .confirmationAction) {
-                Button("Save") { save() }
-                    .disabled(name.isEmpty || model.isEmpty)
+                if !isAccountConnection {
+                    Button("Save") { save() }
+                        .disabled(!edit.hasRequiredFields)
+                }
             }
         }
         .onAppear {
-            if !isNew, let existing = endpoints.endpoints.first(where: { $0.id == id }) {
-                let stored = endpoints.apiKey(for: existing.id) ?? ""
-                hasExistingKey = !stored.isEmpty
-                if apiKey.isEmpty {
-                    apiKey = stored
-                }
+            if !isAccountConnection {
+                hasExistingKey = !(endpoints.apiKey(for: original.id) ?? "").isEmpty
             }
-            // No auto-fill of the base URL: the user enters it.
-        }
-    }
-
-    private func shortName(_ type: AIProviderType) -> String {
-        switch type {
-        case .openAI, .openAICompatible: return "Chat API"
-        case .anthropic, .anthropicCompatible: return "Chat API"
-        }
-    }
-
-    private var apiKeyPlaceholder: String {
-        switch providerType {
-        case .openAI, .openAICompatible: return "API key (sk-…)"
-        case .anthropic, .anthropicCompatible: return "API key (sk-ant-…)"
         }
     }
 
     private func save() {
-        let trimmedURL = baseURLString.trimmingCharacters(in: .whitespacesAndNewlines)
-        let config = EndpointConfig(
-            id: id,
-            name: name.trimmingCharacters(in: .whitespacesAndNewlines),
-            providerType: providerType,
-            baseURLString: trimmedURL,
-            model: model.trimmingCharacters(in: .whitespacesAndNewlines),
-            systemPrompt: systemPrompt,
-            temperature: temperature
-        )
+        // Use the latest synced profile for hidden fields so editing on Watch
+        // cannot erase a concurrent iPhone update to headers or token limits.
+        guard let config = edit.applying(to: currentEndpoint) else {
+            saveError = "Manage this account on iPhone."
+            return
+        }
         endpoints.save(config)
         if !apiKey.isEmpty {
-            endpoints.setAPIKey(apiKey, for: id)
+            endpoints.setAPIKey(apiKey, for: config.id)
         } else if isNew {
-            endpoints.setAPIKey("", for: id)
+            endpoints.setAPIKey("", for: config.id)
         }
-        if endpoints.activeEndpointID == nil {
-            endpoints.setActive(id)
-        }
+        if endpoints.activeEndpointID == nil { endpoints.setActive(config.id) }
         dismiss()
     }
 }

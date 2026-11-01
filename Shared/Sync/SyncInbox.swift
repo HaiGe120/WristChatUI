@@ -44,10 +44,7 @@ public final class SyncInbox {
         )
         for ms in snapshot.messages {
             if let m = existingByID[ms.id] {
-                m.roleRaw = ms.roleRaw
-                m.content = ms.content
-                m.createdAt = ms.createdAt
-                m.orderIndex = ms.orderIndex
+                Self.merge(ms, into: m)
             } else {
                 let m = Message(
                     id: ms.id,
@@ -57,6 +54,7 @@ public final class SyncInbox {
                     orderIndex: ms.orderIndex,
                     conversation: target
                 )
+                m.responseMetadata = ms.responseMetadata
                 context.insert(m)
             }
         }
@@ -83,10 +81,7 @@ public final class SyncInbox {
             predicate: #Predicate { $0.id == messageID }
         )
         if let existing = (try? context.fetch(msgDescriptor))?.first {
-            existing.roleRaw = message.roleRaw
-            existing.content = message.content
-            existing.createdAt = message.createdAt
-            existing.orderIndex = message.orderIndex
+            Self.merge(message, into: existing)
         } else {
             let m = Message(
                 id: message.id,
@@ -96,9 +91,22 @@ public final class SyncInbox {
                 orderIndex: message.orderIndex,
                 conversation: conversation
             )
+            m.responseMetadata = message.responseMetadata
             context.insert(m)
         }
         try? context.save()
+    }
+
+    /// Keep answer text and its citation offsets as one revision across mixed app versions.
+    static func merge(_ incoming: MessageSnapshot, into target: Message) {
+        if let local = target.responseMetadata {
+            guard let remote = incoming.responseMetadata, remote.updatedAt >= local.updatedAt else { return }
+        }
+        target.roleRaw = incoming.roleRaw
+        target.content = incoming.content
+        target.createdAt = incoming.createdAt
+        target.orderIndex = incoming.orderIndex
+        if let metadata = incoming.responseMetadata { target.responseMetadata = metadata }
     }
 
     public func upsertAPIKey(_ value: String, for endpointID: UUID) {
@@ -168,10 +176,7 @@ public final class SyncInbox {
         )
         for ms in snapshot.messages {
             if let m = existingByID[ms.id] {
-                m.roleRaw = ms.roleRaw
-                m.content = ms.content
-                m.createdAt = ms.createdAt
-                m.orderIndex = ms.orderIndex
+                Self.merge(ms, into: m)
             } else {
                 let m = Message(
                     id: ms.id,
@@ -181,6 +186,7 @@ public final class SyncInbox {
                     orderIndex: ms.orderIndex,
                     conversation: target
                 )
+                m.responseMetadata = ms.responseMetadata
                 context.insert(m)
             }
         }

@@ -3,9 +3,12 @@ import SwiftData
 
 struct ChatView: View {
     @Environment(\.modelContext) private var modelContext
+    @Environment(\.scenePhase) private var scenePhase
     @EnvironmentObject private var endpoints: EndpointStore
     @Bindable var conversation: Conversation
     @StateObject private var engine = ChatEngine()
+    @ObservedObject private var searchSources = SearchSourceStore.shared
+    @State private var searchEnabled = false
     @State private var draft: String = ""
     @State private var lastError: String?
     /// Live buffer of the assistant's in-progress reply. Written to the
@@ -33,6 +36,7 @@ struct ChatView: View {
         }
         .navigationTitle(conversation.title)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbarVisibility(.hidden, for: .tabBar)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
@@ -54,17 +58,20 @@ struct ChatView: View {
                 ChatEndpointSheet(conversation: conversation)
             }
         }
-        .alert("Error", isPresented: .init(
-            get: { lastError != nil },
-            set: { if !$0 { lastError = nil } }
-        )) {
-            Button("OK", role: .cancel) { lastError = nil }
-        } message: {
-            Text(lastError ?? "")
+        .onAppear {
+            searchEnabled = endpoint?.searchMode == .auto
+            if !engine.isStreaming { ConversationRequest.reconcileInterrupted(conversation, context: modelContext) }
         }
-        .onChange(of: engine.lastError) { _, newError in
-            if let newError { lastError = newError }
+        .onChange(of: conversation.endpointID) { _, _ in
+            engine.cancel()
+            searchEnabled = endpoint?.searchMode == .auto
         }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { engine.reconcileAfterForeground() }
+            else { try? modelContext.save() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: SearchSourceStore.didChange)) { _ in engine.cancel() }
+        .onDisappear { engine.cancel() }
     }
 
     private var messagesScroll: some View {
@@ -77,6 +84,13 @@ struct ChatView: View {
                             streamingOverride: streamingOverride(for: message)
                         )
                         .id(message.id)
+                        if let metadata = message.responseMetadata,
+                           [.failed, .partial, .cancelled].contains(metadata.phase) {
+                            Button("Retry") { retry(message) }
+                                .font(.caption)
+                                .disabled(engine.isStreaming)
+                                .accessibilityHint("Replaces this reply using the original question")
+                        }
                     }
                 }
                 .padding()
@@ -99,34 +113,39 @@ struct ChatView: View {
     /// `message.content`.
     private func streamingOverride(for message: Message) -> String? {
         guard engine.isStreaming, message.role == .assistant else { return nil }
-        guard let lastAssistant = conversation.sortedMessages.last(where: { $0.role == .assistant }) else {
-            return nil
-        }
-        guard lastAssistant.id == message.id else { return nil }
+        guard let attemptID = engine.metadata?.attemptID,
+              message.responseMetadata?.attemptID == attemptID else { return nil }
         return streamingContent
     }
 
     private var composer: some View {
-        HStack(alignment: .bottom, spacing: 8) {
-            TextField("Message", text: $draft, axis: .vertical)
-                .lineLimit(1...5)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
-                .focused($inputFocused)
-                .disabled(engine.isStreaming)
-            Button(action: send) {
+        VStack(spacing: 4) {
+            HStack {
+                Toggle("Web search · \(searchSources.selectedSource?.name ?? "Native")", isOn: $searchEnabled)
+                    .toggleStyle(.switch)
+                    .font(.caption)
+                    .disabled(engine.isStreaming)
+                Spacer()
                 if engine.isStreaming {
-                    Image(systemName: "stop.circle.fill")
-                        .font(.title)
-                        .foregroundStyle(.red)
-                } else {
-                    Image(systemName: "arrow.up.circle.fill")
-                        .font(.title)
-                        .foregroundStyle(canSend ? Color.accentColor : Color.gray)
+                    Text(engine.metadata?.statusText ?? "Connecting…")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Button("Stop", role: .destructive) { engine.cancel() }
                 }
             }
-            .disabled(!canSend && !engine.isStreaming)
+            HStack(alignment: .bottom, spacing: 8) {
+                TextField("Message", text: $draft, axis: .vertical)
+                    .lineLimit(1...5)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
+                    .focused($inputFocused)
+                Button(action: send) {
+                    Image(systemName: "arrow.up.circle.fill")
+                        .font(.title)
+                }
+                .accessibilityLabel("Send message")
+                .disabled(!canSend || engine.isStreaming)
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -138,95 +157,27 @@ struct ChatView: View {
     }
 
     private func send() {
-        if engine.isStreaming {
-            engine.cancel()
-            return
-        }
-        guard canSend, let endpoint else { return }
-        let userText = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !engine.isStreaming, canSend, let endpoint else { return }
+        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         draft = ""
         inputFocused = false
+        start(endpoint: endpoint, text: text)
+    }
+
+    private func retry(_ message: Message) {
+        guard !engine.isStreaming, let endpoint else { return }
+        start(endpoint: endpoint, retry: message)
+    }
+
+    private func start(endpoint: EndpointConfig, text: String? = nil, retry: Message? = nil) {
         streamingContent = ""
-
-        // Use the live conversation values rather than the EndpointConfig's
-        // denormalized model/systemPrompt, so changes made via the picker
-        // take effect on the very next message.
-        var resolved = endpoint
-        if !conversation.model.isEmpty { resolved.model = conversation.model }
-        if !conversation.systemPrompt.isEmpty || resolved.systemPrompt.isEmpty {
-            resolved.systemPrompt = conversation.systemPrompt
-        }
-
-        let apiKey = endpoints.apiKey(for: resolved.id)
-        let userMessage = Message(
-            role: .user,
-            content: userText,
-            orderIndex: conversation.messages.count,
-            conversation: conversation
-        )
-        let assistantMessage = Message(
-            role: .assistant,
-            content: "",
-            orderIndex: conversation.messages.count + 1,
-            conversation: conversation
-        )
-        modelContext.insert(userMessage)
-        modelContext.insert(assistantMessage)
-        conversation.updatedAt = .now
-        updateTitleIfNeeded(with: userText)
-
-        let history = buildHistory()
-        // NOTE: do NOT capture `streamingContent` in a capture list.
-        // `[streamingContent]` would freeze the value at send-time, so each
-        // delta overwrites the previous one instead of accumulating. The
-        // `@State` wrapper keeps storage stable across captured struct copies,
-        // so `self.streamingContent` always reads the latest buffer.
-        //
-        // We deliberately do NOT mirror each delta into
-        // `assistantMessage.content` from the streaming closure. Mutating
-        // a SwiftData `@Model` property from an escaping closure can lag
-        // per-property observation, leaving the bubble stuck on its "…"
-        // placeholder. Instead, the live `streamingContent` buffer drives
-        // the visible text via the `streamingOverride` parameter on
-        // `MessageBubble`; the `onComplete` handler flushes the final
-        // value into the persisted message once the stream settles.
-        //
-        // `onDelta` is the first trailing closure (positional, unlabeled).
-        // `onComplete:` is the second (must be labeled).
-        engine.send(
-            endpoint: resolved,
-            apiKey: apiKey,
-            messages: history
-        ) { delta in
-            self.streamingContent += delta
-        } onComplete: {
-            // Read the final buffer once, then write it through the model.
-            let final = self.streamingContent
-            assistantMessage.content = final
-            if final.isEmpty, let err = self.engine.lastError {
-                assistantMessage.content = "⚠️ \(err)"
-            }
-            self.streamingContent = ""
-            try? modelContext.save()
-            // Mirror the new message + updated conversation to the paired
-            // watch so it can show the reply in its own chat list.
-            SyncCoordinator.shared.publishConversation(ConversationSnapshot(conversation))
-        }
+        ConversationRequest.start(engine: engine, conversation: conversation, context: modelContext,
+                                  endpoint: endpoint, apiKey: endpoints.apiKey(for: endpoint.id),
+                                  userText: text, retry: retry, searchEnabled: searchEnabled,
+                                  onDelta: { streamingContent += $0 },
+                                  onComplete: { streamingContent = "" })
     }
 
-    private func updateTitleIfNeeded(with firstUserText: String) {
-        if conversation.title == "New chat" || conversation.title.isEmpty {
-            let trimmed = firstUserText.trimmingCharacters(in: .whitespacesAndNewlines)
-            conversation.title = trimmed.prefix(40).description
-            if conversation.title.isEmpty { conversation.title = "New chat" }
-        }
-    }
-
-    private func buildHistory() -> [ChatMessage] {
-        conversation.sortedMessages
-            .filter { $0.role != .system }
-            .map { ChatMessage(role: $0.role, content: $0.content) }
-    }
 }
 
 
@@ -401,7 +352,7 @@ private struct ChatEndpointSheet: View {
         }
         isLoadingModels = true
         loadError = nil
-        let provider = ProviderRegistry.provider(for: endpoint.providerType)
+        let provider = ProviderRegistry.provider(for: endpoint)
         let key = endpoints.apiKey(for: endpoint.id)
         Task {
             do {

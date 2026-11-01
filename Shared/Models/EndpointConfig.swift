@@ -1,5 +1,34 @@
 import Foundation
 
+public enum APIFormat: String, CaseIterable, Codable, Identifiable, Sendable {
+    case chatCompletions, responses, anthropicMessages
+    public var id: String { rawValue }
+    public var displayName: String {
+        switch self {
+        case .chatCompletions: return "OpenAI Chat Completions"
+        case .responses: return "OpenAI Responses"
+        case .anthropicMessages: return "Anthropic Messages"
+        }
+    }
+    var suffix: String {
+        switch self {
+        case .chatCompletions: return "chat/completions"
+        case .responses: return "responses"
+        case .anthropicMessages: return "messages"
+        }
+    }
+}
+
+public enum EndpointAuthentication: String, Codable, CaseIterable, Sendable {
+    case apiKey, chatGPT
+}
+
+public enum SearchMode: String, Codable, CaseIterable, Identifiable, Sendable {
+    case off, auto
+    public var id: String { rawValue }
+    public var displayName: String { self == .off ? "Off" : "Auto" }
+}
+
 public struct EndpointConfig: Identifiable, Codable, Hashable, Sendable {
     public var id: UUID
     public var name: String
@@ -10,156 +39,132 @@ public struct EndpointConfig: Identifiable, Codable, Hashable, Sendable {
     public var temperature: Double
     public var maxTokens: Int?
     public var customHeaders: [String: String]
+    public var apiFormat: APIFormat
+    public var authentication: EndpointAuthentication
+    public var searchMode: SearchMode
+    /// Enabled only after the user verifies their endpoint/model's Chat Completions search contract.
+    public var chatSearchVerified: Bool
+    private var preservesLegacyChatRoot: Bool
+    /// Decode provenance lets sync distinguish an older companion snapshot from intentional new settings.
+    /// Every local save writes the current configuration version.
+    public private(set) var hasExtendedConfiguration: Bool
 
-    public init(
-        id: UUID = UUID(),
-        name: String,
-        providerType: AIProviderType,
-        baseURLString: String,
-        model: String,
-        systemPrompt: String = "",
-        temperature: Double = 0.7,
-        maxTokens: Int? = nil,
-        customHeaders: [String: String] = [:]
-    ) {
-        self.id = id
-        self.name = name
-        self.providerType = providerType
-        self.baseURLString = baseURLString
-        self.model = model
-        self.systemPrompt = systemPrompt
-        self.temperature = temperature
-        self.maxTokens = maxTokens
-        self.customHeaders = customHeaders
+    public init(id: UUID = UUID(), name: String, providerType: AIProviderType,
+                baseURLString: String, model: String, systemPrompt: String = "",
+                temperature: Double = 0.7, maxTokens: Int? = nil,
+                customHeaders: [String: String] = [:], apiFormat: APIFormat? = nil,
+                authentication: EndpointAuthentication = .apiKey, searchMode: SearchMode = .off,
+                chatSearchVerified: Bool = false) {
+        self.id = id; self.name = name; self.providerType = providerType
+        self.baseURLString = baseURLString; self.model = model; self.systemPrompt = systemPrompt
+        self.temperature = temperature; self.maxTokens = maxTokens; self.customHeaders = customHeaders
+        self.apiFormat = apiFormat ?? Self.legacyFormat(providerType: providerType, baseURLString: baseURLString)
+        self.authentication = authentication; self.searchMode = searchMode
+        self.chatSearchVerified = chatSearchVerified
+        self.preservesLegacyChatRoot = false
+        self.hasExtendedConfiguration = true
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, providerType, baseURLString, model, systemPrompt, temperature, maxTokens, customHeaders
+        case apiFormat, authentication, searchMode, chatSearchVerified, preservesLegacyChatRoot, configurationVersion
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        providerType = try c.decode(AIProviderType.self, forKey: .providerType)
+        baseURLString = try c.decode(String.self, forKey: .baseURLString)
+        model = try c.decode(String.self, forKey: .model)
+        systemPrompt = try c.decodeIfPresent(String.self, forKey: .systemPrompt) ?? ""
+        temperature = try c.decodeIfPresent(Double.self, forKey: .temperature) ?? 0.7
+        maxTokens = try c.decodeIfPresent(Int.self, forKey: .maxTokens)
+        customHeaders = try c.decodeIfPresent([String: String].self, forKey: .customHeaders) ?? [:]
+        let storedFormat = try c.decodeIfPresent(APIFormat.self, forKey: .apiFormat)
+        apiFormat = storedFormat ?? Self.legacyFormat(providerType: providerType, baseURLString: baseURLString)
+        preservesLegacyChatRoot = try c.decodeIfPresent(Bool.self, forKey: .preservesLegacyChatRoot) ?? (storedFormat == nil)
+        authentication = try c.decodeIfPresent(EndpointAuthentication.self, forKey: .authentication) ?? .apiKey
+        searchMode = try c.decodeIfPresent(SearchMode.self, forKey: .searchMode) ?? .off
+        chatSearchVerified = try c.decodeIfPresent(Bool.self, forKey: .chatSearchVerified) ?? false
+        hasExtendedConfiguration = (try c.decodeIfPresent(Int.self, forKey: .configurationVersion) ?? 0) >= 2
+            || c.contains(.apiFormat) || c.contains(.authentication) || c.contains(.searchMode)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(2, forKey: .configurationVersion)
+        try c.encode(id, forKey: .id); try c.encode(name, forKey: .name)
+        try c.encode(providerType, forKey: .providerType); try c.encode(baseURLString, forKey: .baseURLString)
+        try c.encode(model, forKey: .model); try c.encode(systemPrompt, forKey: .systemPrompt)
+        try c.encode(temperature, forKey: .temperature); try c.encodeIfPresent(maxTokens, forKey: .maxTokens)
+        try c.encode(customHeaders, forKey: .customHeaders); try c.encode(apiFormat, forKey: .apiFormat)
+        try c.encode(authentication, forKey: .authentication); try c.encode(searchMode, forKey: .searchMode)
+        try c.encode(chatSearchVerified, forKey: .chatSearchVerified)
+        try c.encode(preservesLegacyChatRoot, forKey: .preservesLegacyChatRoot)
+    }
+
+    /// Merge a legacy companion's editable common fields without erasing settings it cannot represent.
+    public func preservingExtendedConfiguration(from current: EndpointConfig) -> EndpointConfig {
+        var merged = self
+        merged.apiFormat = current.apiFormat
+        merged.authentication = current.authentication
+        merged.searchMode = current.searchMode
+        merged.chatSearchVerified = current.chatSearchVerified
+        merged.preservesLegacyChatRoot = current.preservesLegacyChatRoot
+        merged.hasExtendedConfiguration = current.hasExtendedConfiguration
+        return merged
+    }
+
+    private static func legacyFormat(providerType: AIProviderType, baseURLString: String) -> APIFormat {
+        if providerType == .anthropic || providerType == .anthropicCompatible { return .anthropicMessages }
+        if URL(string: baseURLString)?.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")).hasSuffix("responses") == true { return .responses }
+        return .chatCompletions
     }
 
     public var baseURL: URL? {
-        let trimmed = baseURLString.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        return URL(string: trimmed)
+        let value = baseURLString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: value), ["https", "http"].contains(url.scheme?.lowercased() ?? ""),
+              url.host != nil, url.user == nil, url.password == nil else { return nil }
+        return url
     }
+
+    public var canUseNativeSearch: Bool { apiFormat != .chatCompletions || chatSearchVerified }
 
     public func chatCompletionsURL() -> URL? {
         guard let base = baseURL else { return nil }
-        return Self.resolveChatURL(base: base, chatPath: providerType.defaultChatPath)
+        return Self.resolveURL(base: base, suffix: apiFormat.suffix,
+                               addDefaultVersion: !(preservesLegacyChatRoot && apiFormat == .chatCompletions))
     }
 
     public func modelsURL() -> URL? {
         guard let base = baseURL else { return nil }
-        return Self.resolveModelsURL(base: base)
+        return Self.resolveURL(base: base, suffix: "models")
     }
 
-    /// Compose `<base><chatPath>`, avoiding doubled-prefix bugs when the user
-    /// pastes a full endpoint URL instead of an API root.
-    ///
-    /// The chat path can be expressed two ways depending on the provider:
-    ///
-    /// - **Sub-path form** (`/chat/completions`): the chat path is appended to
-    ///   the API root, yielding `https://api.openai.com/v1/chat/completions`.
-    /// - **Absolute form** (`/v1/messages`): the chat path is the full
-    ///   absolute path and is kept intact for providers such as Anthropic.
-    ///
-    /// Foundation's `appendingPathComponent` always appends, so the
-    /// absolute form collides whenever the base already has a matching
-    /// prefix. We detect that collision and return the trimmed chat
-    /// path as the absolute path on the origin.
+    /// Keep the deployment prefix, remove an existing operation suffix, and attach the selected format.
+    /// A root ending in /v1 never acquires another /v1; full endpoint URLs remain usable.
+    static func resolveURL(base: URL, suffix: String, addDefaultVersion: Bool = true) -> URL? {
+        guard var c = URLComponents(url: base, resolvingAgainstBaseURL: false) else { return nil }
+        var parts = c.path.split(separator: "/").map(String.init)
+        var hadOperation = false
+        if parts.suffix(2) == ["chat", "completions"] { parts.removeLast(2); hadOperation = true }
+        else if let last = parts.last, ["responses", "messages", "models"].contains(last) { parts.removeLast(); hadOperation = true }
+        if !hadOperation && addDefaultVersion && parts.last != "v1" { parts.append("v1") }
+        parts.append(contentsOf: suffix.split(separator: "/").map(String.init))
+        c.path = "/" + parts.joined(separator: "/")
+        // Query parameters on a pasted operation URL can carry deployment routing hints.
+        c.fragment = nil
+        return c.url
+    }
+
     static func resolveChatURL(base: URL, chatPath: String) -> URL? {
-        // Rebuild the origin (scheme + host + port) on its own. The
-        // chat path will be reattached below. Using URLComponents here
-        // (rather than `URL.absoluteString` splitting) avoids any
-        // encoding surprises for non-ASCII hosts.
-        guard var comps = URLComponents(url: base, resolvingAgainstBaseURL: false) else {
-            return base
-        }
-        comps.path = ""
-        comps.query = nil
-        comps.fragment = nil
-        guard let originURL = comps.url else { return base }
-        let origin = originURL.absoluteString
-        // Normalise the base path: drop trailing slashes but keep an
-        // empty string for the origin-only case.
-        let basePath = base.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        let trimmed = chatPath.hasPrefix("/") ? String(chatPath.dropFirst()) : chatPath
-        if basePath == "v1/responses" || basePath.hasSuffix("/v1/responses") || basePath == "responses" || basePath.hasSuffix("/responses") {
-            return URL(string: origin + "/" + basePath)
-        }
-        if !trimmed.isEmpty, (basePath == trimmed || basePath.hasSuffix("/" + trimmed)) {
-            return URL(string: origin + "/" + basePath)
-        }
-        // Absolute form: the chat path already starts with the same
-        // segment(s) the base path uses. Just put the trimmed chat
-        // path directly on the origin.
-        if !basePath.isEmpty, trimmed.hasPrefix(basePath + "/") {
-            return URL(string: origin + "/" + trimmed)
-        }
-        // Sub-path form: append the trimmed chat path to the base path.
-        if basePath.isEmpty {
-            return URL(string: origin + "/" + trimmed)
-        }
-        return URL(string: origin + "/" + basePath + "/" + trimmed)
+        let path = chatPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        return resolveURL(base: base, suffix: path.hasPrefix("v1/") ? String(path.dropFirst(3)) : path)
     }
+    static func resolveModelsURL(base: URL) -> URL? { resolveURL(base: base, suffix: "models") }
 
-    static func resolveModelsURL(base: URL) -> URL? {
-        guard let comps = URLComponents(url: base, resolvingAgainstBaseURL: false) else {
-            return base
-        }
-        var originComponents = comps
-        originComponents.path = ""
-        originComponents.query = nil
-        originComponents.fragment = nil
-        guard let originURL = originComponents.url else { return base }
-        let origin = originURL.absoluteString
-        var basePath = base.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        if basePath == "v1/chat/completions" || basePath.hasSuffix("/v1/chat/completions") {
-            basePath = String(basePath.dropLast("/chat/completions".count))
-        } else if basePath == "chat/completions" || basePath.hasSuffix("/chat/completions") {
-            basePath = String(basePath.dropLast("/chat/completions".count))
-        } else if basePath == "v1/responses" || basePath.hasSuffix("/v1/responses") {
-            basePath = String(basePath.dropLast("/responses".count))
-        } else if basePath == "responses" || basePath.hasSuffix("/responses") {
-            basePath = String(basePath.dropLast("/responses".count))
-        }
-        basePath = basePath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        if basePath.hasSuffix("v1") {
-            return URL(string: origin + "/" + basePath + "/models")
-        }
-        if basePath.isEmpty {
-            return URL(string: origin + "/v1/models")
-        }
-        return URL(string: origin + "/" + basePath + "/v1/models")
-    }
-
-    public static let sampleAnthropicCompat = EndpointConfig(
-        name: "Anthropic-compatible (custom)",
-        providerType: .anthropicCompatible,
-        baseURLString: "",
-        model: "claude-3-5-sonnet-latest"
-    )
-
-    /// MiniMax via its OpenAI-compatible endpoint. Seeded into the store so the
-    /// `WA_TEST_API_KEY` launch hook in `WristAssistantApp.init` can locate it by
-    /// name and write the key into the keychain automatically during development.
-    public static let sampleMiniMax = EndpointConfig(
-        name: "MiniMax",
-        providerType: .openAICompatible,
-        baseURLString: "https://api.minimaxi.com/v1",
-        model: "MiniMax-M3"
-    )
-
-    /// MiniMax via the Anthropic-compatible third-party mode. Same upstream
-    /// server, but routed through the Anthropic Messages wire format so users
-    /// can pick whichever their gateway expects. This is what exercises the
-    /// `AnthropicProvider.listModels` server probe in non-native mode.
-    public static let sampleMiniMaxAnthropic = EndpointConfig(
-        name: "MiniMax (Anthropic-compatible)",
-        providerType: .anthropicCompatible,
-        // The Anthropic-compatible base on MiniMax is
-        // https://api.minimaxi.com/anthropic (NOT /v1). The chat
-        // resolver appends `/v1/messages` to whatever base is here, so
-        // a /v1 base would produce /v1/messages and return 404 from
-        // the gateway. The /anthropic base produces /anthropic/v1/messages
-        // which is the documented endpoint.
-        baseURLString: "https://api.minimaxi.com/anthropic",
-        model: "MiniMax-M3"
-    )
+    public static let sampleAnthropicCompat = EndpointConfig(name: "Anthropic-compatible (custom)", providerType: .anthropicCompatible, baseURLString: "", model: "claude-3-5-sonnet-latest")
+    public static let sampleMiniMax = EndpointConfig(name: "MiniMax", providerType: .openAICompatible, baseURLString: "https://api.minimaxi.com/v1", model: "MiniMax-M3")
+    public static let sampleMiniMaxAnthropic = EndpointConfig(name: "MiniMax (Anthropic-compatible)", providerType: .anthropicCompatible, baseURLString: "https://api.minimaxi.com/anthropic", model: "MiniMax-M3")
 }

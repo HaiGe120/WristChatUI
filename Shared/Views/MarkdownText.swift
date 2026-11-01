@@ -12,23 +12,9 @@ struct MarkdownText: View {
     private var rendered: some View {
         if raw.isEmpty {
             Text("...")
-        } else if let attributed = Self.parse(raw, syntax: .full) {
-            selectable(Text(attributed))
-        } else if let attributed = Self.parse(raw, syntax: .inlineOnlyPreservingWhitespace) {
-            selectable(Text(attributed))
         } else {
-            selectable(Text(raw))
+            selectable(Text(MessageTextFormatting.attributed(raw)))
         }
-    }
-
-    private static func parse(
-        _ raw: String,
-        syntax: AttributedString.MarkdownParsingOptions.InterpretedSyntax
-    ) -> AttributedString? {
-        try? AttributedString(
-            markdown: raw,
-            options: .init(interpretedSyntax: syntax, failurePolicy: .returnPartiallyParsedIfPossible)
-        )
     }
 
     @ViewBuilder

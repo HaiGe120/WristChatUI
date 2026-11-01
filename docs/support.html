@@ -7,30 +7,34 @@
 </head>
 <body>
   <h1>WristChatUI — Support</h1>
-  <p>WristChatUI is a private, bring-your-own-key AI chat client for iPhone and Apple Watch.</p>
+  <p>AI chat for iPhone and Apple Watch, with your choice of compatible connection and optional web search.</p>
 
   <h2>Contact</h2>
-  <p>Email: <a href="mailto:a594716212@gmail.com">a594716212@gmail.com</a>.
-     GitHub issues: <a href="https://github.com/HaiGe120/WristChatUI/issues">open one</a>.</p>
+  <p>Email: <a href="mailto:a594716212@gmail.com">a594716212@gmail.com</a> ·
+     GitHub: <a href="https://github.com/HaiGe120/WristChatUI/issues">open an issue</a>.</p>
+  <p>For a connection problem, include the app version, device/OS, API format, model, whether Search is on, and the visible error. Do not include API keys, bearer tokens, private chat content or unredacted configuration files.</p>
 
-  <h2>Privacy</h2>
-  <p>WristChatUI does not collect analytics or telemetry. API keys live in
-     the iOS Keychain; conversations live in a local SwiftData store; the only
-     network calls are to the endpoints you configure. iCloud backup is opt-in
-     and uses your private iCloud Drive container.</p>
+  <h2>Set up chat</h2>
+  <p>On iPhone, open Settings → Endpoints and add the base URL, API format, model and any required key. Supported formats are OpenAI Responses, OpenAI Chat Completions and Anthropic Messages. Compatibility depends on the server's actual implementation. The app does not supply an AI subscription or include ChatGPT subscription sign-in.</p>
 
-  <h2>FAQ</h2>
-  <details><summary>Which providers are supported?</summary>
-    <p>Any OpenAI- or Anthropic-compatible endpoint — OpenAI, Anthropic,
-       MiniMax, Open WebUI, or your own gateway. You bring the API key.</p>
-  </details>
-  <details><summary>Does WristChatUI see my conversations?</summary>
-    <p>No. Everything stays on your devices and the endpoints you configure.</p>
-  </details>
-  <details><summary>Where is my data stored?</summary>
-    <p>On your iPhone, your Apple Watch, and (if you opt in) your iCloud Drive.
-       No data is sent to WristChatUI because there is no WristChatUI
-       server.</p>
-  </details>
+  <h2>Use web search</h2>
+  <p>Search defaults to Off. Enable Web search inside a chat. With Native selected, a supported model decides when to use its server-side search tool. A compatible chat API does not automatically imply search support; availability also depends on the model and account.</p>
+  <p>To use a separate source, open Settings → Search sources. MiniMax plan search uses an explicitly entered key for the selected region and requires the relevant entitlement. A custom MCP source needs a remotely reachable HTTPS Streamable HTTP server, one selected search tool, its question field and any required fixed arguments. Bearer tokens and custom API-header credentials are supported. Desktop command/stdio configurations need a separately hosted HTTP bridge. Interactive MCP OAuth and arbitrary client actions are outside the supported search subset.</p>
+  <p>The selected source receives your question and the chat model receives its returned references. Search status distinguishes ordinary answers, reference-only material, successful search and failures. Source details contain returned links rather than links invented by the app.</p>
+
+  <h2>Connection failures and Retry</h2>
+  <p>Stop cancels the active attempt. After a timeout or interrupted reply, Retry reuses the original question and replaces that interrupted response. Sending a new message creates a separate turn. Useful partial text remains labeled; a disconnected stream is not marked complete. No ambiguous timed-out generation is automatically resent.</p>
+  <p>If a native search tool is explicitly unsupported, select another configured source or turn Search off. Recheck native search in the connection editor after changing the server, model or account capabilities. A network timeout or usage limit is not evidence that search is unsupported.</p>
+
+  <h2>Apple Watch networking</h2>
+  <p>The Watch app uses watchOS networking for its requests. A nearby iPhone, working sync and a working iPhone VPN do not establish the network route or VPN rules used by a Watch request. The app does not provide a foreground iPhone chat relay.</p>
+  <p>For comparison, use the same endpoint, API format and model on both devices, with Search off for one test. Note the Watch connection icon and inspect your VPN client's connection log for the endpoint hostname, matched rule and outbound. A missing log entry is a clue, not a confirmed cause. Connection help is available on Watch beside network errors and in Endpoints. Do not remove your library or credentials to diagnose a timeout.</p>
+
+  <h2>Data, sync and backups</h2>
+  <p>Chat keys use Keychain, search credentials use a separate Keychain service, and conversations are stored locally. Profiles, credentials and chats sync to the paired device. Optional iCloud backups include messages and compact source details but not credentials from secure key fields. Deleting a chat does not erase older backup copies. See the <a href="privacy.html">Privacy Policy</a>.</p>
+
+  <h2>GitHub release files</h2>
+  <p>Read the signing and installation notes for each release asset. An App Store distribution IPA is not directly installable by downloading it. Development/ad hoc packages require suitable signing and device registration. The iPhone package contains its matching Watch app.</p>
+  <p><a href="index.html">Home</a> · <a href="https://github.com/HaiGe120/WristChatUI/releases">GitHub Releases</a></p>
 </body>
 </html>

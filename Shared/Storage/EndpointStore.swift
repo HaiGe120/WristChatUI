@@ -89,7 +89,12 @@ public final class EndpointStore: ObservableObject {
     /// remote update is treated as the new source of truth, but the change
     /// does NOT republish (we don't want a phone↔watch ping-pong loop).
     public func applyRemoteEndpoints(_ remote: [EndpointConfig], activeID: UUID?) {
-        endpoints = remote
+        let currentByID = Dictionary(uniqueKeysWithValues: endpoints.map { ($0.id, $0) })
+        endpoints = remote.map { incoming in
+            guard !incoming.hasExtendedConfiguration, let current = currentByID[incoming.id] else { return incoming }
+            if current.authentication == .chatGPT { return current }
+            return incoming.preservingExtendedConfiguration(from: current)
+        }
         if let activeID, remote.contains(where: { $0.id == activeID }) {
             activeEndpointID = activeID
         } else {
@@ -112,10 +117,12 @@ public final class EndpointStore: ObservableObject {
     }
 
     public func apiKey(for endpointID: UUID) -> String? {
-        KeychainStore.get("\(endpointID.uuidString).apikey")
+        guard endpoints.first(where: { $0.id == endpointID })?.authentication != .chatGPT else { return nil }
+        return KeychainStore.get("\(endpointID.uuidString).apikey")
     }
 
     public func setAPIKey(_ value: String, for endpointID: UUID) {
+        guard endpoints.first(where: { $0.id == endpointID })?.authentication != .chatGPT else { return }
         if value.isEmpty {
             KeychainStore.delete("\(endpointID.uuidString).apikey")
         } else {
