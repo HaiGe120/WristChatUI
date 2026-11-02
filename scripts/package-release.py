@@ -84,23 +84,32 @@ def main() -> None:
     if len(ipa_files) != 1:
         raise ValueError("Expected exactly one newly exported IPA")
     ipa = ipa_files[0]
-    archive_apps = list((args.archive / "Products" / "Applications").glob("*.app"))
-    if len(archive_apps) != 1:
-        raise ValueError("Expected one combined iPhone application in the archive")
-    # The archive may be published optionally, so apply the same no-device-ID checks.
-    for app in collect_bundles(archive_apps[0]):
-        validate_bundle(app, args.version, args.build)
     args.output.mkdir(parents=True, exist_ok=True)
     if any(args.output.iterdir()):
         raise ValueError("Refusing to mix release artifacts into a nonempty output directory")
     prefix = f"WristChatUI-{args.version}-{args.build}"
+    # Documents may be managed by FileProvider, which can attach unsigned Finder
+    # metadata after Xcode signs an otherwise valid app. Verify a clean copy in
+    # local temporary storage, preserving every signed byte in the original.
     with tempfile.TemporaryDirectory(prefix="wristchatui-release-") as directory:
-        unpacked = Path(directory)
+        temporary = Path(directory)
+        staged_archive = temporary / args.archive.name
+        subprocess.run(["ditto", "--noextattr", "--noqtn", str(args.archive), str(staged_archive)], check=True)
+        subprocess.run(["/usr/bin/xattr", "-cr", str(staged_archive)], check=True)
+        archive_apps = list((staged_archive / "Products" / "Applications").glob("*.app"))
+        if len(archive_apps) != 1:
+            raise ValueError("Expected one combined iPhone application in the archive")
+        for app in collect_bundles(archive_apps[0]):
+            validate_bundle(app, args.version, args.build)
+
+        unpacked = temporary / "exported"
+        unpacked.mkdir()
         with zipfile.ZipFile(ipa) as package:
             for item in package.infolist():
                 if item.filename.startswith("/") or ".." in Path(item.filename).parts:
                     raise ValueError("Unsafe archive member")
         subprocess.run(["ditto", "-x", "-k", str(ipa), str(unpacked)], check=True)
+        subprocess.run(["/usr/bin/xattr", "-cr", str(unpacked)], check=True)
         apps = list((unpacked / "Payload").glob("*.app"))
         if len(apps) != 1:
             raise ValueError("Expected one iPhone application in the exported IPA")
@@ -109,15 +118,15 @@ def main() -> None:
         shutil.copyfile(ipa, args.output / f"{prefix}-iOS-with-watchOS.ipa")
         subprocess.run(["ditto", "-c", "-k", "--keepParent", str(bundles[1]),
                         str(args.output / f"{prefix}-watchOS.app.zip")], check=True)
-    if args.include_symbols:
-        symbols = args.archive / "dSYMs"
-        if not symbols.is_dir():
-            raise ValueError("Archive has no dSYMs")
-        subprocess.run(["ditto", "-c", "-k", "--keepParent", str(symbols),
-                        str(args.output / f"{prefix}-dSYMs.zip")], check=True)
-    if args.include_archive:
-        subprocess.run(["ditto", "-c", "-k", "--keepParent", str(args.archive),
-                        str(args.output / f"{prefix}.xcarchive.zip")], check=True)
+        if args.include_symbols:
+            symbols = staged_archive / "dSYMs"
+            if not symbols.is_dir():
+                raise ValueError("Archive has no dSYMs")
+            subprocess.run(["ditto", "-c", "-k", "--keepParent", str(symbols),
+                            str(args.output / f"{prefix}-dSYMs.zip")], check=True)
+        if args.include_archive:
+            subprocess.run(["ditto", "-c", "-k", "--keepParent", str(staged_archive),
+                            str(args.output / f"{prefix}.xcarchive.zip")], check=True)
     manifest = {"product": "WristChatUI", "version": args.version, "build": args.build,
                 "sourceCommit": args.commit, "distribution": "App Store distribution",
                 "appBundles": metadata,
@@ -137,7 +146,11 @@ def main() -> None:
     checksums = []
     for path in sorted(args.output.iterdir()):
         if path.is_file():
-            checksums.append(f"{hashlib.file_digest(path.open('rb'), 'sha256').hexdigest()}  {path.name}")
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            checksums.append(f"{digest.hexdigest()}  {path.name}")
     (args.output / "SHA256SUMS.txt").write_text("\n".join(checksums) + "\n")
     print(f"Validated {len(EXPECTED)} matching distribution bundles; assets: {args.output}")
 
