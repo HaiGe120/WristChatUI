@@ -4,28 +4,34 @@ import SwiftData
 struct ChatView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @EnvironmentObject private var endpoints: EndpointStore
     @Bindable var conversation: Conversation
-    @StateObject private var engine = ChatEngine()
+    @ObservedObject private var session: ChatSession
+    @ObservedObject private var voice = VoiceConversationController.shared
+    @ObservedObject private var voicePreferences = VoicePreferences.shared
+    @State private var isVisible = false
+
+    init(conversation: Conversation) {
+        self.conversation = conversation
+        self.session = ChatSessionCoordinator.shared.session(for: conversation.id)
+    }
+
+    private var engine: ChatEngine { session.engine }
     @ObservedObject private var searchSources = SearchSourceStore.shared
-    @State private var searchEnabled = false
-    @State private var draft: String = ""
-    @State private var lastError: String?
-    /// Live buffer of the assistant's in-progress reply. Written to the
-    /// Message row on completion. This guarantees the view re-renders
-    /// even if SwiftData's per-property observation lags the stream.
-    @State private var streamingContent: String = ""
+    private var searchEnabled: Bool {
+        get { session.searchEnabled ?? (endpoint?.searchMode == .auto) }
+        nonmutating set { session.searchEnabled = newValue }
+    }
+    private var draft: String {
+        get { session.draft }
+        nonmutating set { session.draft = newValue }
+    }
     @State private var presentingEndpointSheet = false
     @FocusState private var inputFocused: Bool
 
     private var endpoint: EndpointConfig? {
         endpoints.endpoints.first(where: { $0.id == conversation.endpointID })
-    }
-
-    /// The currently-streaming assistant message, if any. We find it by
-    /// looking for the last assistant message that has no content yet.
-    private var streamingAssistantMessage: Message? {
-        conversation.sortedMessages.last(where: { $0.role == .assistant })
     }
 
     var body: some View {
@@ -36,20 +42,16 @@ struct ChatView: View {
         }
         .navigationTitle(conversation.title)
         .navigationBarTitleDisplayMode(.inline)
-        .toolbarVisibility(.hidden, for: .tabBar)
+        .toolbarVisibility(horizontalSizeClass == .compact ? .hidden : .automatic, for: .tabBar)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
                     presentingEndpointSheet = true
                 } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "chevron.up.chevron.down")
-                        Text(conversation.model)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                    }
-                    .font(.caption)
+                    Image(systemName: "slider.horizontal.3")
                 }
+                .accessibilityLabel("Switch model")
+                .accessibilityValue(conversation.model)
                 .disabled(endpoints.endpoints.isEmpty)
             }
         }
@@ -59,19 +61,23 @@ struct ChatView: View {
             }
         }
         .onAppear {
-            searchEnabled = endpoint?.searchMode == .auto
-            if !engine.isStreaming { ConversationRequest.reconcileInterrupted(conversation, context: modelContext) }
+            isVisible = true
+            if session.searchEnabled == nil { searchEnabled = endpoint?.searchMode == .auto }
+            ChatSessionCoordinator.shared.reconcile(conversation, context: modelContext)
         }
         .onChange(of: conversation.endpointID) { _, _ in
-            engine.cancel()
+            stopConversation()
             searchEnabled = endpoint?.searchMode == .auto
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { engine.reconcileAfterForeground() }
             else { try? modelContext.save() }
         }
-        .onReceive(NotificationCenter.default.publisher(for: SearchSourceStore.didChange)) { _ in engine.cancel() }
-        .onDisappear { engine.cancel() }
+        .onChange(of: conversation.model) { _, _ in stopConversation() }
+        .onDisappear {
+            isVisible = false
+            if voice.conversationID == conversation.id { voice.stop(surface: .phone) }
+        }
     }
 
     private var messagesScroll: some View {
@@ -86,15 +92,25 @@ struct ChatView: View {
                         .id(message.id)
                         if let metadata = message.responseMetadata,
                            [.failed, .partial, .cancelled].contains(metadata.phase) {
-                            Button("Retry") { retry(message) }
-                                .font(.caption)
-                                .disabled(engine.isStreaming)
-                                .accessibilityHint("Replaces this reply using the original question")
+                            HStack(spacing: 20) {
+                                Button("Retry") { retry(message) }
+                                    .accessibilityHint("Replaces this reply using the original question")
+                                if metadata.searchOutcome != .off {
+                                    Button("Retry without search") { retry(message, searchOverride: false) }
+                                        .accessibilityHint("Uses the original question once, with web search off")
+                                }
+                            }
+                            .font(.caption)
+                            .disabled(engine.isStreaming)
                         }
                     }
                 }
                 .padding()
+                .frame(maxWidth: 800)
+                .frame(maxWidth: .infinity)
             }
+            .scrollDismissesKeyboard(.interactively)
+            .defaultScrollAnchor(.bottom)
             .onChange(of: conversation.messages.count) { _, _ in
                 if let last = conversation.sortedMessages.last {
                     withAnimation(.easeOut(duration: 0.2)) {
@@ -115,41 +131,115 @@ struct ChatView: View {
         guard engine.isStreaming, message.role == .assistant else { return nil }
         guard let attemptID = engine.metadata?.attemptID,
               message.responseMetadata?.attemptID == attemptID else { return nil }
-        return streamingContent
+        return session.streamingContent
     }
 
     private var composer: some View {
-        VStack(spacing: 4) {
-            HStack {
-                Toggle("Web search · \(searchSources.selectedSource?.name ?? "Native")", isOn: $searchEnabled)
-                    .toggleStyle(.switch)
-                    .font(.caption)
-                    .disabled(engine.isStreaming)
-                Spacer()
-                if engine.isStreaming {
+        VStack(spacing: 8) {
+            voiceControls
+            Toggle(isOn: Binding(get: { searchEnabled }, set: { searchEnabled = $0 })) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Web search")
+                    Text(searchSources.selectedSource?.name ?? "Native")
+                        .foregroundStyle(.secondary)
+                }
+                .font(.caption)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+            .toggleStyle(.switch)
+            .disabled(engine.isStreaming)
+            if engine.isStreaming {
+                HStack {
                     Text(engine.metadata?.statusText ?? "Connecting…")
                         .font(.caption).foregroundStyle(.secondary)
-                    Button("Stop", role: .destructive) { engine.cancel() }
+                    Spacer()
+                    Button("Stop", role: .destructive) { stopConversation() }
                 }
             }
             HStack(alignment: .bottom, spacing: 8) {
-                TextField("Message", text: $draft, axis: .vertical)
+                TextField("Message", text: $session.draft, axis: .vertical)
                     .lineLimit(1...5)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
                     .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
                     .focused($inputFocused)
+                Button {
+                    inputFocused = false
+                    if voice.conversationID == conversation.id, voice.state == .listening {
+                        voice.finishListening()
+                    } else if let endpoint {
+                        voice.begin(conversation: conversation, context: modelContext, endpoint: endpoint,
+                                    searchEnabled: searchEnabled, surface: .phone)
+                    }
+                } label: {
+                    Image(systemName: voice.conversationID == conversation.id && voice.state == .listening ? "checkmark.circle.fill" : "mic.circle")
+                        .font(.title)
+                }
+                .accessibilityLabel(voice.conversationID == conversation.id && voice.state == .listening ? "Send voice message" : "Record voice message")
+                .frame(minWidth: 44, minHeight: 44)
+                .disabled(engine.isStreaming || endpoint == nil || voice.isCarPlayConnected)
                 Button(action: send) {
                     Image(systemName: "arrow.up.circle.fill")
                         .font(.title)
                 }
                 .accessibilityLabel("Send message")
-                .disabled(!canSend || engine.isStreaming)
+                .frame(minWidth: 44, minHeight: 44)
+                .disabled(!canSend || engine.isStreaming || (voice.conversationID == conversation.id && voice.state == .listening))
             }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
+        .frame(maxWidth: 800)
+        .frame(maxWidth: .infinity)
         .background(.bar)
+    }
+
+    private var voiceControls: some View {
+        HStack {
+            if voice.isCarPlayConnected {
+                Label("Voice is connected to CarPlay", systemImage: "car")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else if voice.conversationID == conversation.id, voice.state == .listening {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Listening… Tap the checkmark to send.").font(.caption)
+                    if !voice.transcript.isEmpty { Text(voice.transcript).font(.caption).lineLimit(3) }
+                }
+                Spacer()
+                Button("Cancel") { voice.stop(surface: .phone) }.font(.caption)
+            } else if voice.conversationID == conversation.id, voice.state == .speaking {
+                Label("Speaking…", systemImage: "speaker.wave.2").font(.caption)
+                Spacer()
+                Button("Stop speaking") { voice.stop(surface: .phone) }.font(.caption)
+            } else if voice.conversationID == conversation.id, voice.state == .thinking, !engine.isStreaming {
+                Text("Finishing voice input…").font(.caption)
+                Spacer()
+                Button("Cancel") { voice.stop(surface: .phone) }.font(.caption)
+            } else {
+                if voice.conversationID == conversation.id, let message = voice.statusMessage {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(message).font(.caption).foregroundStyle(.secondary)
+                        NavigationLink("Voice settings") { PhoneVoiceSettingsView() }.font(.caption)
+                    }
+                }
+                Spacer()
+                Button { voice.replay(conversation: conversation, surface: .phone) } label: {
+                    Label("Read reply", systemImage: "speaker.wave.2")
+                }
+                .font(.caption)
+                .disabled(engine.isStreaming || !hasCompletedReply)
+            }
+        }
+    }
+
+    private var hasCompletedReply: Bool {
+        conversation.sortedMessages.contains {
+            $0.role == .assistant && !$0.content.isEmpty && ($0.responseMetadata?.phase == .completed || $0.responseMetadata == nil)
+        }
+    }
+
+    private func stopConversation() {
+        if voice.conversationID == conversation.id { voice.stop() }
+        session.cancel()
     }
 
     private var canSend: Bool {
@@ -159,23 +249,29 @@ struct ChatView: View {
     private func send() {
         guard !engine.isStreaming, canSend, let endpoint else { return }
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        draft = ""
-        inputFocused = false
-        start(endpoint: endpoint, text: text)
+        if start(endpoint: endpoint, text: text) {
+            draft = ""
+            inputFocused = false
+        }
     }
 
-    private func retry(_ message: Message) {
+    private func retry(_ message: Message, searchOverride: Bool? = nil) {
         guard !engine.isStreaming, let endpoint else { return }
-        start(endpoint: endpoint, retry: message)
+        start(endpoint: endpoint, retry: message, searchOverride: searchOverride)
     }
 
-    private func start(endpoint: EndpointConfig, text: String? = nil, retry: Message? = nil) {
-        streamingContent = ""
-        ConversationRequest.start(engine: engine, conversation: conversation, context: modelContext,
-                                  endpoint: endpoint, apiKey: endpoints.apiKey(for: endpoint.id),
-                                  userText: text, retry: retry, searchEnabled: searchEnabled,
-                                  onDelta: { streamingContent += $0 },
-                                  onComplete: { streamingContent = "" })
+    @discardableResult
+    private func start(endpoint: EndpointConfig, text: String? = nil, retry: Message? = nil, searchOverride: Bool? = nil) -> Bool {
+        if voice.conversationID == conversation.id, voice.activeSurface == .phone {
+            voice.stop(surface: .phone)
+        }
+        return session.send(conversation: conversation, context: modelContext, endpoint: endpoint,
+                            apiKey: endpoints.apiKey(for: endpoint.id), text: text, retry: retry,
+                            searchEnabled: searchOverride ?? searchEnabled) { reply, metadata in
+            guard isVisible, scenePhase == .active, voicePreferences.automaticallySpeakReplies,
+                  metadata.phase == .completed, !voice.isCarPlayConnected else { return }
+            voice.speakReply(reply, conversationID: conversation.id, surface: .phone)
+        }
     }
 
 }

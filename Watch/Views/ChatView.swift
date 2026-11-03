@@ -15,21 +15,22 @@ struct ChatView: View {
     @Bindable var conversation: Conversation
     let focusComposerOnAppear: Bool
 
-    @StateObject private var engine = ChatEngine()
+    @ObservedObject private var session: ChatSession
+    @ObservedObject private var speech = SpeechPlaybackController.shared
+    @ObservedObject private var voicePreferences = VoicePreferences.shared
+    @State private var isVisible = false
+    @State private var isSceneActive = false
+    @State private var lastVoiceError: String?
+    private var engine: ChatEngine { session.engine }
     @ObservedObject private var searchSources = SearchSourceStore.shared
     @State private var searchEnabled = false
     @State private var draft: String = ""
-    @State private var lastError: String?
-    /// Live buffer of the assistant's in-progress reply. Mirrors the
-    /// iOS pattern: accumulate into this `@State` so the row updates
-    /// in real time, then flush the final value into the SwiftData
-    /// `Message` on stream completion.
-    @State private var streamingContent: String = ""
     @State private var presentingEndpointPicker = false
     @State private var focusComposerTrigger = 0
 
     init(conversation: Conversation, focusComposerOnAppear: Bool = false) {
         self.conversation = conversation
+        self.session = ChatSessionCoordinator.shared.session(for: conversation.id)
         self.focusComposerOnAppear = focusComposerOnAppear
     }
 
@@ -61,19 +62,29 @@ struct ChatView: View {
             }
         }
         .onAppear {
+            isVisible = true
+            isSceneActive = scenePhase == .active
             searchEnabled = endpoint?.searchMode == .auto
-            if !engine.isStreaming { ConversationRequest.reconcileInterrupted(conversation, context: modelContext) }
+            ChatSessionCoordinator.shared.reconcile(conversation, context: modelContext)
         }
         .onChange(of: conversation.endpointID) { _, _ in
-            engine.cancel()
+            stop()
             searchEnabled = endpoint?.searchMode == .auto
         }
         .onChange(of: scenePhase) { _, phase in
+            isSceneActive = phase == .active
             if phase == .active { engine.reconcileAfterForeground() }
-            else { try? modelContext.save() }
+            else {
+                speech.stop(ownerID: conversation.id)
+                try? modelContext.save()
+            }
         }
-        .onReceive(NotificationCenter.default.publisher(for: SearchSourceStore.didChange)) { _ in engine.cancel() }
-        .onDisappear { engine.cancel() }
+        .onReceive(NotificationCenter.default.publisher(for: SearchSourceStore.didChange)) { _ in stop() }
+        .onChange(of: conversation.model) { _, _ in stop() }
+        .onDisappear {
+            isVisible = false
+            stop()
+        }
     }
 
     /// The composer is the final scroll item, matching Apple Watch
@@ -94,6 +105,11 @@ struct ChatView: View {
                             Button("Retry") { start(retry: message) }
                                 .font(.caption)
                                 .disabled(engine.isStreaming)
+                            if metadata.searchOutcome != .off {
+                                Button("Retry without search") { start(retry: message, searchOverride: false) }
+                                    .font(.caption)
+                                    .disabled(engine.isStreaming)
+                            }
                             if ["timeout", "offline", "connectionLost", "incomplete"].contains(metadata.errorCode ?? "") {
                                 NavigationLink("Connection help") { WatchConnectionHelpView() }
                                     .font(.caption2)
@@ -108,14 +124,35 @@ struct ChatView: View {
                         Text(engine.metadata?.statusText ?? "Connecting…")
                             .font(.caption2).foregroundStyle(.secondary)
                     }
+                    if speech.isSpeaking, speech.ownerID == conversation.id {
+                        Button("Stop speaking", systemImage: "speaker.slash") {
+                            speech.stop(ownerID: conversation.id)
+                        }.font(.caption2)
+                    } else if let reply = conversation.sortedMessages.last(where: {
+                        $0.role == .assistant && !$0.content.isEmpty && ($0.responseMetadata?.phase == .completed || $0.responseMetadata == nil)
+                    }) {
+                        Button("Read reply", systemImage: "speaker.wave.2") {
+                            lastVoiceError = nil
+                            speech.speak(reply.content, ownerID: conversation.id) { lastVoiceError = speech.lastError }
+                        }
+                        .font(.caption2)
+                        .disabled(engine.isStreaming)
+                    }
+                    if let error = lastVoiceError {
+                        Text(error).font(.caption2).foregroundStyle(.secondary)
+                    }
                     ComposerView(
                         text: $draft,
                         isStreaming: engine.isStreaming,
                         canSend: canSend,
                         focusTrigger: focusComposerTrigger,
                         onSend: { send() },
-                        onStop: { engine.cancel() },
-                        onSubmitText: { send($0) }
+                        onStop: { stop() },
+                        onSubmitText: { send($0, fromDictation: true) },
+                        onBeginInput: {
+                            lastVoiceError = nil
+                            speech.stop()
+                        }
                     )
                     .id(composerID)
                 }
@@ -157,26 +194,36 @@ struct ChatView: View {
         guard engine.isStreaming, message.role == .assistant else { return nil }
         guard let attemptID = engine.metadata?.attemptID,
               message.responseMetadata?.attemptID == attemptID else { return nil }
-        return streamingContent
+        return session.streamingContent
     }
 
-    private func send(_ submittedText: String? = nil) {
+    private func send(_ submittedText: String? = nil, fromDictation: Bool = false) {
         if let submittedText { draft = submittedText }
+        guard isVisible, isSceneActive else { return }
         guard !engine.isStreaming else { return }
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
-        draft = ""
-        start(text: text)
+        if start(text: text, voiceTurn: fromDictation) { draft = "" }
     }
 
-    private func start(text: String? = nil, retry: Message? = nil) {
-        guard !engine.isStreaming, let endpoint else { return }
-        streamingContent = ""
-        ConversationRequest.start(engine: engine, conversation: conversation, context: modelContext,
-                                  endpoint: endpoint, apiKey: endpoints.apiKey(for: endpoint.id),
-                                  userText: text, retry: retry, searchEnabled: searchEnabled,
-                                  onDelta: { streamingContent += $0 },
-                                  onComplete: { streamingContent = "" })
+    private func stop() {
+        speech.stop(ownerID: conversation.id)
+        session.cancel()
+    }
+
+    @discardableResult
+    private func start(text: String? = nil, retry: Message? = nil, voiceTurn: Bool = false, searchOverride: Bool? = nil) -> Bool {
+        guard let endpoint else { return false }
+        lastVoiceError = nil
+        speech.stop()
+        return session.send(conversation: conversation, context: modelContext, endpoint: endpoint,
+                            apiKey: endpoints.apiKey(for: endpoint.id), text: text, retry: retry,
+                            searchEnabled: searchOverride ?? searchEnabled,
+                            additionalSystemPrompt: voiceTurn ? VoiceTextFormatting.applying(toSystemPrompt: "") : nil) { reply, metadata in
+            guard isVisible, isSceneActive, voicePreferences.automaticallySpeakReplies,
+                  metadata.phase == .completed else { return }
+            speech.speak(reply, ownerID: conversation.id) { lastVoiceError = speech.lastError }
+        }
     }
 
 }

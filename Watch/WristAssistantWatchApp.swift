@@ -23,7 +23,7 @@ struct WristAssistantWatchApp: App {
 
     var body: some Scene {
         WindowGroup {
-            RootView()
+            rootContent
                 .environmentObject(endpointStore)
                 .environmentObject(SyncCoordinator.shared)
                 .task {
@@ -42,5 +42,18 @@ struct WristAssistantWatchApp: App {
                 }
         }
         .modelContainer(DataStore.shared)
+    }
+
+    @ViewBuilder
+    private var rootContent: some View {
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["WA_TEST_VOICE_SETTINGS"] == "1" {
+            NavigationStack { VoiceSettingsView() }
+        } else {
+            RootView()
+        }
+        #else
+        RootView()
+        #endif
     }
 }

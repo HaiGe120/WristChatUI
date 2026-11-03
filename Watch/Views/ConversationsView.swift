@@ -36,6 +36,9 @@ struct ConversationsView: View {
                     }
                 }
                 Section {
+                    NavigationLink { VoiceSettingsView() } label: {
+                        Label("Voice", systemImage: "speaker.wave.2")
+                    }
                     Button {
                         startNewChat(withPrompt: nil)
                     } label: {
@@ -254,6 +257,7 @@ struct ConversationsView: View {
 
     private func delete(at offsets: IndexSet) {
         let ids = offsets.map { conversations[$0].id }
+        for id in ids { ChatSessionCoordinator.shared.remove(conversationID: id) }
         for index in offsets {
             modelContext.delete(conversations[index])
         }

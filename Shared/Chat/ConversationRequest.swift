@@ -7,7 +7,10 @@ public enum ConversationRequest {
     public static func start(engine: ChatEngine, conversation: Conversation, context: ModelContext,
                              endpoint: EndpointConfig, apiKey: String?, userText: String? = nil,
                              retry: Message? = nil, searchEnabled: Bool,
-                             onDelta: @escaping (String) -> Void, onComplete: @escaping () -> Void) {
+                             additionalSystemPrompt: String? = nil,
+                             onDelta: @escaping (String) -> Void, onComplete: @escaping () -> Void,
+                             onResult: @escaping (String, ResponseMetadata) -> Void = { _, _ in },
+                             onAnswerReset: @escaping () -> Void = {}) {
         guard !engine.isStreaming else { return }
         let user: Message
         let assistant: Message
@@ -35,6 +38,9 @@ public enum ConversationRequest {
         var resolved = endpoint
         if !conversation.model.isEmpty { resolved.model = conversation.model }
         resolved.systemPrompt = conversation.systemPrompt
+        if let additionalSystemPrompt, !additionalSystemPrompt.isEmpty {
+            resolved.systemPrompt += "\n" + additionalSystemPrompt
+        }
         #if os(watchOS)
         resolved.systemPrompt = WatchResponseFormatting.applying(toSystemPrompt: resolved.systemPrompt)
         #endif
@@ -52,12 +58,18 @@ public enum ConversationRequest {
                         }
                     },
                     onMetadata: { metadata in assistant.responseMetadata = metadata },
+                    onAnswerReset: {
+                        assistant.content = ""
+                        onAnswerReset()
+                        try? context.save()
+                    },
                     onComplete: { text, metadata in
                         assistant.content = text
                         assistant.responseMetadata = metadata
                         conversation.updatedAt = .now
                         try? context.save()
                         SyncCoordinator.shared.publishConversation(ConversationSnapshot(conversation))
+                        onResult(text, metadata)
                         onComplete()
                     })
         try? context.save()

@@ -17,6 +17,7 @@ struct ComposerView: View {
     let onSend: () -> Void
     let onStop: () -> Void
     let onSubmitText: (String) -> Void
+    let onBeginInput: () -> Void
 
     @State private var isPresentingTextInput = false
     @State private var lastHandledFocusTrigger = 0
@@ -97,10 +98,11 @@ struct ComposerView: View {
         if focusTrigger > 0 {
             lastHandledFocusTrigger = focusTrigger
         }
-        guard let controller = WKExtension.shared().visibleInterfaceController else {
+        guard let controller = WKApplication.shared().visibleInterfaceController else {
             return
         }
         isPresentingTextInput = true
+        onBeginInput()
         controller.presentTextInputController(
             withSuggestions: nil,
             allowedInputMode: .allowEmoji

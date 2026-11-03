@@ -14,6 +14,9 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             List {
+                Section("Voice") {
+                    NavigationLink("Voice") { PhoneVoiceSettingsView() }
+                }
                 Section("Apple Watch sync") {
                     HStack {
                         Image(systemName: syncIcon)

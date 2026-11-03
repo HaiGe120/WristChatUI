@@ -17,6 +17,10 @@
 # Usage:
 #   scripts/sim.sh build            # build only, no sim interaction
 #   scripts/sim.sh boot             # boot sim + install + launch + screenshot
+#   SIMCTL_CHILD_WA_TEST_VOICE_SETTINGS=1 scripts/sim.sh boot # voice settings smoke check
+#   SIM_CAPTURE_COUNT=3 SIM_DIAGNOSTICS=1 scripts/sim.sh boot # bounded diagnostics
+#   SIM_DEVICE_NAME='iPhone Duo' SIM_DISPLAY=1 SIM_REVIEW_SECONDS=180 scripts/sim.sh boot
+#     # monitored pose review; screenshot with SIM_DISPLAY=1 (outer) or 3 (inner)
 #   scripts/sim.sh watch-build      # build watch app only
 #   scripts/sim.sh watch-boot       # boot watch sim + install + launch + screenshot
 #   WATCH_LAUNCH_ARGS="--auto-new-chat" scripts/sim.sh watch-boot
@@ -44,6 +48,8 @@ WATCH_BUNDLE_ID="com.wristassistant.app.watchkitapp"
 APP_PATH="${DERIVED}/Build/Products/Debug-iphonesimulator/WristAssistant.app"
 WATCH_APP_PATH="${DERIVED}/Build/Products/Debug-watchsimulator/WristAssistantWatch.app"
 LOG_DIR="${DERIVED}/sim-logs"
+REVIEW_SECONDS="${SIM_REVIEW_SECONDS:-0}"
+DISPLAY_ID="${SIM_DISPLAY:-}"
 
 XCODE_DEV="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
 export PATH="${XCODE_DEV}/usr/bin:${XCODE_DEV}/bin:${PATH}"
@@ -53,6 +59,26 @@ mkdir -p "${LOG_DIR}"
 
 log() { printf '[sim.sh %s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 
+validate_capture_options() {
+  if [[ ! "${REVIEW_SECONDS}" =~ ^[0-9]+$ || "${#REVIEW_SECONDS}" -gt 3 || "${REVIEW_SECONDS}" -gt 180 ]]; then
+    log "ERROR: SIM_REVIEW_SECONDS must be between 0 and 180"
+    return 2
+  fi
+  if [[ -n "${DISPLAY_ID}" && ! "${DISPLAY_ID}" =~ ^[1-9][0-9]?$ ]]; then
+    log "ERROR: SIM_DISPLAY must be a display number between 1 and 99"
+    return 2
+  fi
+}
+
+capture_phone() {
+  local udid="$1" output="$2"
+  if [[ -n "${DISPLAY_ID}" ]]; then
+    simctl_bounded io "${udid}" screenshot "--display=${DISPLAY_ID}" "${output}"
+  else
+    simctl_bounded io "${udid}" screenshot "${output}"
+  fi
+}
+
 # A stalled CoreSimulator command must not hold a boot session open indefinitely.
 # Alarm survives exec; EXIT cleanup still owns app termination and simulator shutdown.
 simctl_bounded() {
@@ -60,8 +86,10 @@ simctl_bounded() {
   case "$1" in
     bootstatus) limit=120 ;;
     install) limit=60 ;;
-    launch) limit=45 ;;
+    launch) limit=90 ;;
+    spawn) limit=5 ;;
     terminate) limit=10 ;;
+    get_app_container) limit=5 ;;
   esac
   limit="${SIM_COMMAND_TIMEOUT_SECONDS:-${limit}}"
   if [[ ! "${limit}" =~ ^[1-9][0-9]*$ || "${limit}" -gt 180 ]]; then
@@ -69,6 +97,20 @@ simctl_bounded() {
     return 2
   fi
   /usr/bin/perl -e '$sim_timeout=shift; alarm $sim_timeout; exec @ARGV or die "cannot run simulator command\n"' "${limit}" xcrun simctl "$@"
+}
+
+# Installation can return before Launch Services finishes replacing its placeholder.
+# Check registration before the sole launch, rather than retrying a hung app launch.
+wait_for_app_registration() {
+  local app_udid="$1" app_bundle="$2" attempt
+  for (( attempt=1; attempt<=6; attempt++ )); do
+    if simctl_bounded get_app_container "${app_udid}" "${app_bundle}" app >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  log "ERROR: app registration did not finish within the bounded readiness check"
+  return 2
 }
 
 
@@ -145,6 +187,7 @@ cmd_watch_build() {
 }
 
 cmd_boot() {
+  validate_capture_options
   install_cleanup_traps
   log "shutdown all (precaution)"
   cmd_teardown
@@ -176,13 +219,42 @@ cmd_boot() {
 
   log "install"
   simctl_bounded install "${udid}" "${APP_PATH}"
+  wait_for_app_registration "${udid}" "${BUNDLE_ID}"
 
   log "launch (foreground, no --console-pty, no &)"
   simctl_bounded launch "${udid}" "${BUNDLE_ID}"
 
-  sleep 3 # bounded first-frame settling time; always below AGENTS.md's 10-second limit
-  log "screenshot -> ${LOG_DIR}/launch.png"
-  simctl_bounded io "${udid}" screenshot "${LOG_DIR}/launch.png"
+  local capture_count="${SIM_CAPTURE_COUNT:-1}"
+  if [[ ! "${capture_count}" =~ ^[1-3]$ ]]; then
+    log "ERROR: SIM_CAPTURE_COUNT must be 1, 2, or 3"
+    exit 2
+  fi
+  local capture_index
+  for (( capture_index=1; capture_index<=capture_count; capture_index++ )); do
+    sleep 3 # bounded settling between at most three diagnostic frames
+    log "screenshot ${capture_index}/${capture_count} -> ${LOG_DIR}/launch.png"
+    capture_phone "${udid}" "${LOG_DIR}/launch.png"
+    if [[ "${capture_count}" -gt 1 ]]; then
+      cp "${LOG_DIR}/launch.png" "${LOG_DIR}/launch-${capture_index}.png"
+    fi
+  done
+  collect_app_diagnostics
+  if [[ "${REVIEW_SECONDS}" -gt 0 ]]; then
+    log "UI review window: ${REVIEW_SECONDS}s; no further app launches; cleanup on exit"
+    local review_deadline=$(( SECONDS + REVIEW_SECONDS ))
+    while (( SECONDS < review_deadline )); do
+      # Follow AGENTS.md: poll the running guest instead of a long sleep.
+      # Stop immediately if the host trampoline crosses the regression limit.
+      simctl_bounded spawn "${udid}" launchctl print system > "${LOG_DIR}/review-launchctl.txt"
+      local review_processes
+      review_processes="$(ps -axo pid=,rss=,command=)" || return 3
+      if printf '%s\n' "${review_processes}" | awk '$0 ~ /SimulatorTrampoline/ && $0 !~ /awk/ && $2 > 204800 { found=1 } END { exit !found }'; then
+        log "ERROR: SimulatorTrampoline above 200 MiB during review; stopping"
+        return 3
+      fi
+      sleep 1
+    done
+  fi
   log "capture complete. udid=${udid}; cleaning up on exit"
 }
 
@@ -210,6 +282,7 @@ cmd_watch_boot() {
 
   log "watch install"
   simctl_bounded install "${udid}" "${WATCH_APP_PATH}"
+  wait_for_app_registration "${udid}" "${WATCH_BUNDLE_ID}"
 
   log "watch launch (foreground, no --console-pty, no &)"
   if [[ -n "${WATCH_LAUNCH_ARGS:-}" ]]; then
@@ -227,11 +300,12 @@ cmd_watch_boot() {
 }
 
 cmd_screenshot() {
+  validate_capture_options
   local out="${1:-${LOG_DIR}/shot.png}"
   local udid
   udid="$(cat "${LOG_DIR}/udid" 2>/dev/null || resolve_device_udid)"
   [[ -z "${udid}" ]] && { log "no booted sim"; exit 1; }
-  simctl_bounded io "${udid}" screenshot "${out}"
+  capture_phone "${udid}" "${out}"
   log "saved ${out}"
 }
 
@@ -276,10 +350,21 @@ install_cleanup_traps() {
 cleanup_after_session() {
   local result="$1"
   trap - EXIT INT TERM HUP
+  if [[ "${result}" -ne 0 ]]; then collect_app_diagnostics; fi
   if ! cmd_teardown; then
     result=3
   fi
   exit "${result}"
+}
+
+collect_app_diagnostics() {
+  [[ "${SIM_DIAGNOSTICS:-0}" == 1 ]] || return 0
+  local diagnostic_udid
+  diagnostic_udid="$(cat "${LOG_DIR}/udid" 2>/dev/null || true)"
+  [[ -n "${diagnostic_udid}" ]] || return 0
+  simctl_bounded spawn "${diagnostic_udid}" log show --last 2m --style compact --info \
+    --predicate 'process == "WristAssistant" OR eventMessage CONTAINS "com.wristassistant.app"' \
+    > "${LOG_DIR}/app.log" 2>&1 || true
 }
 
 check_regressions() {
@@ -351,6 +436,7 @@ case "${1:-}" in
   teardown)     cmd_teardown ;;
   status)       cmd_status ;;
   devices)      simctl_bounded list devices available ;;
+  io-help)      simctl_bounded io help ;;
   ""|"-h"|"--help")
     sed -n '2,25p' "$0"
     ;;

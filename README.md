@@ -10,11 +10,14 @@ Bring your own AI connection to iPhone and Apple Watch, with optional web search
 ## Features
 
 - Native iPhone and Apple Watch chat, with dictation and conversation history on Watch
+- Adaptive iPhone Duo layouts with a conversation sidebar on wider windows, readable chat widths, and per-conversation drafts that survive layout changes
+- iPhone voice input, optional spoken replies on iPhone and Watch, and local language/speed preferences
+- CarPlay source for a future release; the current distribution omits the scene and restricted entitlement
 - Explicit **OpenAI Responses**, **OpenAI Chat Completions**, and **Anthropic Messages** API formats for compatible providers and custom gateways
 - **Web search Off/Auto** using a supported endpoint/model's native search, with search activity, returned source details and citation links
 - Optional independent search sources: **MiniMax plan search** or a selected search tool on a **remote HTTPS MCP server**
 - Clear interrupted/partial reply states, Stop and Retry without duplicating the original question, and recovery after connection failures
-- Readable paragraphs, lists and code on Watch; the iPhone chat screen hides the bottom tabs while a conversation is open
+- Readable paragraphs, lists and code on Watch; compact iPhone conversations hide the tabs while wider layouts keep them accessible
 - Paired-device sync of connection profiles, securely stored keys and conversations
 - Watch complications, Smart Stack widget and Siri Shortcuts for starting a chat
 - Optional iCloud Drive conversation backup and restore, including compact source metadata
@@ -36,6 +39,14 @@ A custom MCP source must be remotely reachable over HTTPS and support the app's 
 
 The Watch makes its own app requests using watchOS networking. Sync with a nearby phone is not an app-level request relay, and a working phone VPN does not establish the route or VPN rules of a Watch request. **Connection help** on Watch explains a comparison check without automatically resending a timed-out request.
 
+### Voice and CarPlay
+
+On iPhone, open **Settings → Voice** to grant microphone and speech recognition access. In a chat, tap the microphone, speak, then tap the checkmark to send, or pause to let recognition finish. **Read reply** plays the latest completed answer. Automatic playback is off by default on iPhone and Watch and can be enabled separately on each device. Choose the speech language and speed in Voice settings. The Watch continues to use Apple's system input screen for dictation; its speech-language preference controls playback.
+
+CarPlay uses the active configured AI connection and always speaks completed replies. Its screen shows short voice-state labels and controls, with complete text retained in the normal chat history. Finish permission and connection setup before driving. Recognition may use Apple's servers; the app sends transcribed text to the configured AI connection and does not save microphone recordings. Incoming synced history never starts playback.
+
+The source includes a CarPlay scene implementation. The current distribution omits its scene registration and entitlement. Enabling it requires Apple's approval for the voice-based conversational category and provisioning profiles containing that capability. Local compilation does not establish entitlement approval or real-car audio compatibility. See [CarPlay setup and validation](docs/CARPLAY-VOICE.md).
+
 ## GitHub release downloads
 
 Release assets identify their signing and intended use. An App Store distribution IPA is an upload artifact; downloading it does not make it directly installable on arbitrary devices. A development or ad hoc build requires appropriate device registration/signing. The iPhone package embeds its matching Watch app; a separate Watch archive is not an independent iPhone installer. Follow the instructions included with the particular release.
@@ -43,6 +54,8 @@ Release assets identify their signing and intended use. An App Store distributio
 ## Building
 
 The project uses [XcodeGen](https://github.com/yonaskolb/XcodeGen); the `.xcodeproj` is generated from `project.yml`.
+
+Build with Xcode 27.1 or later for native iPhone Duo display adaptation. The minimum supported iOS version remains 26.0.
 
 ```bash
 brew install xcodegen

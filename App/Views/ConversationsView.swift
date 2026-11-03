@@ -6,20 +6,25 @@ struct ConversationsView: View {
     @EnvironmentObject private var endpoints: EndpointStore
     @EnvironmentObject private var sync: SyncCoordinator
     @Query(sort: [SortDescriptor(\Conversation.updatedAt, order: .reverse)]) private var conversations: [Conversation]
-    @State private var path: [UUID] = []
+    @State private var selectedConversationID: UUID?
+    @State private var preferredCompactColumn: NavigationSplitViewColumn = .sidebar
     @State private var isResyncing = false
 
     var body: some View {
-        NavigationStack(path: $path) {
+        NavigationSplitView(preferredCompactColumn: $preferredCompactColumn) {
             Group {
                 if conversations.isEmpty {
-                    ContentUnavailableView(
-                        "No chats yet",
-                        systemImage: "bubble.left.and.bubble.right",
-                        description: Text("Start a new chat or open one on your Apple Watch.")
-                    )
+                    ContentUnavailableView {
+                        Label("No chats yet", systemImage: "bubble.left.and.bubble.right")
+                    } description: {
+                        Text("Start a new chat or open one on your Apple Watch.")
+                    } actions: {
+                        Button("New chat", systemImage: "square.and.pencil", action: startNewChat)
+                            .buttonStyle(.borderedProminent)
+                            .disabled(endpoints.endpoints.isEmpty)
+                    }
                 } else {
-                    List {
+                    List(selection: $selectedConversationID) {
                         if isResyncing {
                             HStack {
                                 ProgressView()
@@ -46,22 +51,37 @@ struct ConversationsView: View {
                     } label: {
                         Label("New", systemImage: "square.and.pencil")
                     }
+                    .disabled(endpoints.endpoints.isEmpty)
                 }
             }
-            .navigationDestination(for: UUID.self) { id in
-                if let conversation = conversations.first(where: { $0.id == id }) {
-                    ChatView(conversation: conversation)
-                } else {
-                    Text("Conversation not found").foregroundStyle(.secondary)
+            .navigationSplitViewColumnWidth(min: 240, ideal: 290, max: 340)
+        } detail: {
+            if let conversation = conversations.first(where: { $0.id == selectedConversationID }) {
+                ChatView(conversation: conversation)
+                    .id(conversation.id)
+            } else {
+                ContentUnavailableView {
+                    Label("Your next conversation", systemImage: "bubble.left.and.bubble.right")
+                } description: {
+                    Text("Choose a chat from the sidebar or start a new one.")
+                } actions: {
+                    Button("New chat", systemImage: "square.and.pencil", action: startNewChat)
+                        .buttonStyle(.borderedProminent)
+                        .disabled(endpoints.endpoints.isEmpty)
                 }
+                .navigationTitle("WristChatUI")
             }
-
         }
+        .navigationSplitViewStyle(.balanced)
         .onOpenURL { url in
             handleDeepLink(url)
         }
         .onAppear {
             #if DEBUG
+            if let screen = ScreenshotPreview.screen {
+                if screen == "chat" { openConversation(ScreenshotPreview.conversationID) }
+                return
+            }
             seedTestThreeDotChatIfRequested()
             #endif
             consumePendingShortcutIfAny()
@@ -75,6 +95,11 @@ struct ConversationsView: View {
         // next sync run will resurrect it on the iPhone because the
         // watch still has the full snapshot.
         let ids = offsets.map { conversations[$0].id }
+        if let selectedConversationID, ids.contains(selectedConversationID) {
+            self.selectedConversationID = nil
+            preferredCompactColumn = .sidebar
+        }
+        for id in ids { ChatSessionCoordinator.shared.remove(conversationID: id) }
         for index in offsets {
             modelContext.delete(conversations[index])
         }
@@ -135,7 +160,7 @@ struct ConversationsView: View {
         modelContext.insert(conversation)
         try? modelContext.save()
         SyncCoordinator.shared.publishConversation(ConversationSnapshot(conversation))
-        path.append(conversation.id)
+        openConversation(conversation.id)
     }
 
     private func createConversationFromShortcut(prompt: String) {
@@ -160,7 +185,12 @@ struct ConversationsView: View {
         }
         try? modelContext.save()
         SyncCoordinator.shared.publishConversation(ConversationSnapshot(conversation))
-        path.append(conversation.id)
+        openConversation(conversation.id)
+    }
+
+    private func openConversation(_ id: UUID) {
+        selectedConversationID = id
+        preferredCompactColumn = .detail
     }
     #if DEBUG
     /// One-shot test hook. When the app is launched with
@@ -186,7 +216,7 @@ struct ConversationsView: View {
         modelContext.insert(Message(role: .user, content: "Hello", orderIndex: 0, conversation: conv))
         modelContext.insert(Message(role: .assistant, content: "", orderIndex: 1, conversation: conv))
         try? modelContext.save()
-        path.append(conv.id)
+        openConversation(conv.id)
     }
     #endif
 

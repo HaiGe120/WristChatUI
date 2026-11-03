@@ -110,6 +110,9 @@ public final class SyncInbox {
     }
 
     public func upsertAPIKey(_ value: String, for endpointID: UUID) {
+        if (KeychainStore.get("\(endpointID.uuidString).apikey") ?? "") != value {
+            NotificationCenter.default.post(name: EndpointStore.willChange, object: endpointID)
+        }
         if value.isEmpty {
             KeychainStore.delete("\(endpointID.uuidString).apikey")
         } else {
@@ -122,6 +125,7 @@ public final class SyncInbox {
     /// a no-op, so a delete arriving before the conversation itself is
     /// fine.
     public func deleteConversation(_ id: UUID) {
+        ChatSessionCoordinator.shared.remove(conversationID: id)
         let context = container.mainContext
         let descriptor = FetchDescriptor<Conversation>(
             predicate: #Predicate { $0.id == id }

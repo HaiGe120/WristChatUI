@@ -4,8 +4,16 @@ import SwiftData
 @main
 struct WristAssistantApp: App {
     @StateObject private var endpointStore = EndpointStore.shared
+    private let modelContainer: ModelContainer
 
     init() {
+        #if DEBUG
+        if ScreenshotPreview.screen != nil {
+            modelContainer = ScreenshotPreview.makeContainer()
+            return
+        }
+        #endif
+        modelContainer = DataStore.shared
         // The iPhone is the source of truth for endpoint catalog + API
         // keys. Marking this here makes every EndpointStore.save / setActive
         // / setAPIKey call publish through SyncCoordinator.
@@ -45,10 +53,23 @@ struct WristAssistantApp: App {
 
     var body: some Scene {
         WindowGroup {
-            RootView()
+            rootContent
                 .environmentObject(endpointStore)
                 .environmentObject(SyncCoordinator.shared)
         }
-        .modelContainer(DataStore.shared)
+        .modelContainer(modelContainer)
+    }
+
+    @ViewBuilder
+    private var rootContent: some View {
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["WA_TEST_VOICE_SETTINGS"] == "1" {
+            NavigationStack { PhoneVoiceSettingsView() }
+        } else {
+            RootView()
+        }
+        #else
+        RootView()
+        #endif
     }
 }

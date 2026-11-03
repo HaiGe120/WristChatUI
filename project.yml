@@ -8,7 +8,7 @@ options:
   groupSortPosition: top
   generateEmptyDirectories: true
   developmentLanguage: en
-  xcodeVersion: "26.5"
+  xcodeVersion: "27.2"
 
 settings:
   base:
@@ -18,7 +18,7 @@ settings:
     CODE_SIGN_STYLE: Automatic
     ENABLE_USER_SCRIPT_SANDBOXING: YES
     GENERATE_INFOPLIST_FILE: NO
-    CURRENT_PROJECT_VERSION: 3
+    CURRENT_PROJECT_VERSION: 7
     MARKETING_VERSION: "1.1.0"
     IPHONEOS_DEPLOYMENT_TARGET: "26.0"
     WATCHOS_DEPLOYMENT_TARGET: "11.0"
@@ -47,7 +47,10 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.wristassistant.app
         SUPPORTED_PLATFORMS: "iphoneos iphonesimulator"
         TARGETED_DEVICE_FAMILY: "1"
+        WRIST_DEVICE_ENTITLEMENTS_PATH: App/WristAssistant.entitlements
       configs:
+        Debug:
+          "CODE_SIGN_ENTITLEMENTS[sdk=iphoneos*]": "$(WRIST_DEVICE_ENTITLEMENTS_PATH)"
         Release:
           CODE_SIGN_STYLE: Manual
           CODE_SIGN_IDENTITY: "09E6DC14B92303A16DD32E13A43CA8272D5E3381"
@@ -71,6 +74,10 @@ targets:
           UIColorName: ""
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
+        NSMicrophoneUsageDescription: "WristChatUI uses the microphone to turn your spoken questions into chat messages."
+        NSSpeechRecognitionUsageDescription: "WristChatUI uses Apple speech recognition to transcribe your questions. Audio may be processed by Apple."
+        UIBackgroundModes:
+          - audio
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft

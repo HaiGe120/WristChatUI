@@ -7,6 +7,7 @@ xcrun swiftc -swift-version 5 -module-cache-path ./build/derived/provider-fixtur
   Shared/Models/MessageRole.swift Shared/Models/ChatMessage.swift Shared/Models/AIProviderType.swift \
   Shared/Models/EndpointConfig.swift Shared/Networking/SSEParser.swift Shared/Networking/StreamingHTTP.swift \
   Shared/Providers/AIProvider.swift Shared/Providers/OpenAIProvider.swift Shared/Providers/AnthropicProvider.swift \
+  Shared/Providers/NativeSearchSynthesis.swift \
   Shared/Providers/ProviderRegistry.swift Tests/ProviderFixtures/main.swift \
   -o ./build/derived/provider-fixtures
 ./build/derived/provider-fixtures

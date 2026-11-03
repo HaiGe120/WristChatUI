@@ -4,6 +4,7 @@ import Combine
 @MainActor
 public final class EndpointStore: ObservableObject {
     public static let shared = EndpointStore()
+    public static let willChange = Notification.Name("EndpointStoreWillChange")
 
     private let key = "endpoints.v1"
     private let activeKey = "endpoint.active.v1"
@@ -59,6 +60,7 @@ public final class EndpointStore: ObservableObject {
     }
 
     public func save(_ updated: EndpointConfig) {
+        NotificationCenter.default.post(name: Self.willChange, object: updated.id)
         if let idx = endpoints.firstIndex(where: { $0.id == updated.id }) {
             endpoints[idx] = updated
         } else {
@@ -69,6 +71,7 @@ public final class EndpointStore: ObservableObject {
     }
 
     public func delete(_ id: UUID) {
+        NotificationCenter.default.post(name: Self.willChange, object: id)
         endpoints.removeAll { $0.id == id }
         if activeEndpointID == id {
             activeEndpointID = endpoints.first?.id
@@ -89,6 +92,9 @@ public final class EndpointStore: ObservableObject {
     /// remote update is treated as the new source of truth, but the change
     /// does NOT republish (we don't want a phone↔watch ping-pong loop).
     public func applyRemoteEndpoints(_ remote: [EndpointConfig], activeID: UUID?) {
+        if endpoints != remote {
+            NotificationCenter.default.post(name: Self.willChange, object: nil)
+        }
         let currentByID = Dictionary(uniqueKeysWithValues: endpoints.map { ($0.id, $0) })
         endpoints = remote.map { incoming in
             guard !incoming.hasExtendedConfiguration, let current = currentByID[incoming.id] else { return incoming }
@@ -123,6 +129,7 @@ public final class EndpointStore: ObservableObject {
 
     public func setAPIKey(_ value: String, for endpointID: UUID) {
         guard endpoints.first(where: { $0.id == endpointID })?.authentication != .chatGPT else { return }
+        NotificationCenter.default.post(name: Self.willChange, object: endpointID)
         if value.isEmpty {
             KeychainStore.delete("\(endpointID.uuidString).apikey")
         } else {

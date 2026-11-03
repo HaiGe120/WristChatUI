@@ -38,7 +38,7 @@ public final class Conversation {
     }
 
     public var sortedMessages: [Message] {
-        messages.sorted { $0.orderIndex < $1.orderIndex }
+        ConversationOrdering.sorted(messages)
     }
 
     public var lastMessagePreview: String {

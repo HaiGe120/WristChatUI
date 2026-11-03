@@ -48,6 +48,7 @@ public final class ChatEngine: ObservableObject {
                      searchSource: SearchSourceProfile? = nil, searchCredential: String? = nil,
                      budget: RequestBudget? = nil, onDelta: @escaping (String) -> Void,
                      onMetadata: @escaping (ResponseMetadata) -> Void = { _ in },
+                     onAnswerReset: @escaping () -> Void = {},
                      onComplete: @escaping (String, ResponseMetadata) -> Void) {
         guard activeID == nil else { return }
         let id = UUID()
@@ -110,17 +111,60 @@ public final class ChatEngine: ObservableObject {
                             self.change(id: id, phase: .receiving)
                             onDelta(delta)
                         }
-                    case .searchActivity(let activity):
+                    case .processing:
+                        // Nonempty reasoning deltas are useful progress, but their
+                        // contents never enter displayed/persisted answer text.
                         self.hasResult = true
                         self.lastProgressAt = .now
-                        self.change(id: id, phase: activity == .searching ? .searching : .receiving) { meta in
+                        self.change(id: id, phase: .receiving)
+                    case .answerStarted(let sources):
+                        let evidence = sources.filter { $0.safeURL != nil }
+                        guard !evidence.isEmpty else { throw APIError.insufficientSearchEvidence }
+                        // This is another phase of the same attempt: do not reset its
+                        // original start time, watchdog or original user-message ID.
+                        self.text = ""
+                        self.hasResult = true
+                        self.lastProgressAt = .now
+                        self.change(id: id, phase: .receiving) { meta in
+                            meta.usesSourceSynthesis = true
+                            meta.searchSource = meta.searchSource ?? "Native"
+                            meta.searchOutcome = .succeeded
+                            meta.citations = evidence.map { source in
+                                var citation = source
+                                citation.startIndex = nil
+                                citation.endIndex = nil
+                                return citation
+                            }
+                        }
+                        onAnswerReset()
+                    case .searchActivity(let activity):
+                        let nextPhase: AttemptPhase = activity == .searching ? .searching : .receiving
+                        let changed = self.phase != nextPhase || self.metadata?.searchSource != "Native" ||
+                            (activity == .limitReached && self.metadata?.searchLimitReached != true)
+                        if changed {
+                            self.hasResult = true
+                            self.lastProgressAt = .now
+                        }
+                        self.change(id: id, phase: nextPhase) { meta in
                             meta.searchSource = "Native"
-                            meta.searchOutcome = activity == .searching ? .searching : .succeeded
+                            switch activity {
+                            case .searching: meta.searchOutcome = .searching
+                            case .completed: meta.searchOutcome = .succeeded
+                            case .limitReached:
+                                meta.searchLimitReached = true
+                                meta.searchOutcome = meta.citations.isEmpty ? .notUsed : .succeeded
+                            }
                         }
                     case .citation(let citation):
-                        self.hasResult = true
-                        self.lastProgressAt = .now
+                        if self.metadata?.usesSourceSynthesis == true {
+                            guard let incomingURL = citation.safeURL?.absoluteString,
+                                  self.metadata?.citations.contains(where: { $0.safeURL?.absoluteString == incomingURL }) == true else {
+                                continue
+                            }
+                        }
                         if self.metadata?.citations.contains(where: { $0.id == citation.id }) == false {
+                            self.hasResult = true
+                            self.lastProgressAt = .now
                             self.metadata?.citations.append(citation)
                         }
                     case .completed:
@@ -131,6 +175,9 @@ public final class ChatEngine: ObservableObject {
                 }
                 guard self.activeID == id else { return }
                 if completed {
+                    guard !self.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                        throw APIError.emptyResponse
+                    }
                     if searchSource == nil, self.metadata?.searchOutcome == .succeeded || self.metadata?.searchOutcome == .searching {
                         NativeSearchCapabilities.shared.record(.supported, for: endpoint)
                     }
@@ -146,7 +193,7 @@ public final class ChatEngine: ObservableObject {
                     self.metadata?.searchOutcome = .unavailable
                 }
                 let cancelled = error is CancellationError || (error as? APIError).map { if case .cancelled = $0 { return true }; return false } == true
-                self.finalize(id: id, phase: cancelled ? .cancelled : (self.text.isEmpty ? .failed : .partial), error: cancelled ? nil : error)
+                self.finalize(id: id, phase: cancelled ? .cancelled : (self.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .failed : .partial), error: cancelled ? nil : error)
             }
         }
         watchdogTask = Task { [weak self] in
@@ -172,11 +219,15 @@ public final class ChatEngine: ObservableObject {
     private func checkDeadline(id: UUID) {
         guard activeID == id else { return }
         let now = Date()
-        if now.timeIntervalSince(startedAt) >= budget.overall ||
-            (!hasResult && now.timeIntervalSince(startedAt) >= budget.firstResult) ||
-            (hasResult && now.timeIntervalSince(lastProgressAt) >= budget.inactivity) {
-            finalize(id: id, phase: text.isEmpty ? .failed : .partial, error: APIError.timeout)
-        }
+        let detail: String
+        if now.timeIntervalSince(startedAt) >= budget.overall {
+            detail = metadata?.searchOutcome == .off ? "The reply took too long to finish." : "Search took too long to finish. Retry without search or ask a narrower question."
+        } else if !hasResult && now.timeIntervalSince(startedAt) >= budget.firstResult {
+            detail = "No response arrived before the request timed out."
+        } else if hasResult && now.timeIntervalSince(lastProgressAt) >= budget.inactivity {
+            detail = "The response stopped making progress and timed out."
+        } else { return }
+        finalize(id: id, phase: text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .failed : .partial, error: APIError.timeout, failureMessage: detail)
     }
 
     private func change(id: UUID, phase: AttemptPhase, update: (inout ResponseMetadata) -> Void = { _ in }) {
@@ -187,7 +238,7 @@ public final class ChatEngine: ObservableObject {
         if var value = metadata { update(&value); metadata = value }
     }
 
-    private func finalize(id: UUID, phase: AttemptPhase, error: Error? = nil) {
+    private func finalize(id: UUID, phase: AttemptPhase, error: Error? = nil, failureMessage: String? = nil) {
         guard activeID == id, var meta = metadata else { return }
         // Clear ownership BEFORE cancellation and user callbacks, so Stop→Send is immediately safe.
         activeID = nil
@@ -203,8 +254,9 @@ public final class ChatEngine: ObservableObject {
         if let error {
             let failure = Self.failure(error)
             meta.errorCode = failure.code
-            meta.errorMessage = failure.message
-            lastError = failure.message
+            meta.errorMessage = failureMessage ?? failure.message
+            lastError = meta.errorMessage
+            if failure.code == "searchLimit" { meta.searchLimitReached = true }
             if meta.searchOutcome == .searching { meta.searchOutcome = .failed }
         } else if phase == .completed, meta.searchOutcome == .searching {
             meta.searchOutcome = .succeeded
@@ -226,6 +278,12 @@ public final class ChatEngine: ObservableObject {
             case .unsupportedTool: return ("unsupportedTool", "Live search unavailable for this connection and model")
             case .quota: return ("quota", "Provider usage limit reached")
             case .server: return ("server", "The provider could not complete this request")
+            case .searchLimitReached: return ("searchLimit", api.errorDescription ?? "Search limit reached")
+            case .continuationLimitReached: return ("continuationLimit", api.errorDescription ?? "The reply did not finish within the continuation limit")
+            case .outputLimitReached: return ("outputLimit", api.errorDescription ?? "The response reached its output limit")
+            case .contextLimitReached: return ("contextLimit", api.errorDescription ?? "The conversation is too long for this model")
+            case .emptyResponse: return ("emptyResponse", "The provider returned no answer text. Try again or choose another model.")
+            case .insufficientSearchEvidence: return ("insufficientSearchEvidence", api.errorDescription ?? "Search returned no readable evidence to finish the answer.")
             default: break
             }
         }

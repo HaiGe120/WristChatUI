@@ -12,6 +12,7 @@ struct EndpointEditorView: View {
     @State private var model: String = ""
     @State private var systemPrompt: String = ""
     @State private var temperature: Double = 0.7
+    @State private var maxTokensText: String = ""
     @State private var apiKey: String = ""
     @State private var hasExistingKey: Bool = false
     @State private var isTestingConnection = false
@@ -36,6 +37,7 @@ struct EndpointEditorView: View {
         _model = State(initialValue: endpoint?.model ?? "")
         _systemPrompt = State(initialValue: endpoint?.systemPrompt ?? "")
         _temperature = State(initialValue: endpoint?.temperature ?? 0.7)
+        _maxTokensText = State(initialValue: endpoint?.maxTokens.map(String.init) ?? "")
         _isNew = State(initialValue: endpoint == nil)
     }
 
@@ -124,6 +126,20 @@ struct EndpointEditorView: View {
             Section("Behavior") {
                 TextField("System prompt (optional)", text: $systemPrompt, axis: .vertical)
                     .lineLimit(1...4)
+                TextField("Maximum output tokens (optional)", text: $maxTokensText)
+                    .keyboardType(.numberPad)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                if !outputTokenLimit.isValid {
+                    Text("Enter a positive whole number, or leave blank to use the default.")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+                Text(apiFormat == .anthropicMessages
+                     ? "Leave blank to use this app's Messages default of 2,048 output tokens. Higher limits can increase usage and cost; supported limits depend on the provider and model."
+                     : "Leave blank to use the server's default output limit. Higher limits can increase usage and cost; supported limits depend on the provider and model.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 VStack(alignment: .leading) {
                     HStack {
                         Text("Temperature")
@@ -143,7 +159,7 @@ struct EndpointEditorView: View {
                         Text(isTestingConnection ? "Testing…" : "Test connection & load models")
                     }
                 }
-                .disabled(model.isEmpty || isTestingConnection)
+                .disabled(model.isEmpty || isTestingConnection || !outputTokenLimit.isValid)
                 if let result = testResult {
                     Text(result)
                         .font(.caption)
@@ -171,7 +187,7 @@ struct EndpointEditorView: View {
             }
             ToolbarItem(placement: .confirmationAction) {
                 Button("Save") { save() }
-                    .disabled(name.isEmpty || model.isEmpty)
+                    .disabled(name.isEmpty || model.isEmpty || !outputTokenLimit.isValid)
             }
         }
         .onAppear {
@@ -192,6 +208,10 @@ struct EndpointEditorView: View {
         apiFormat == .anthropicMessages ? .anthropicCompatible : .openAICompatible
     }
 
+    private var outputTokenLimit: OutputTokenLimitEdit {
+        OutputTokenLimitEdit(maxTokensText)
+    }
+
     private var configuredEndpoint: EndpointConfig {
         var config = existing ?? EndpointConfig(name: name, providerType: providerType,
                                                  baseURLString: baseURLString, model: model)
@@ -205,6 +225,7 @@ struct EndpointEditorView: View {
         config.model = model.trimmingCharacters(in: .whitespacesAndNewlines)
         config.systemPrompt = systemPrompt
         config.temperature = temperature
+        config.maxTokens = outputTokenLimit.value
         return config
     }
 
@@ -216,6 +237,7 @@ struct EndpointEditorView: View {
     }
 
     private func save() {
+        guard outputTokenLimit.isValid else { return }
         let config = configuredEndpoint
         endpoints.save(config)
         if !apiKey.isEmpty {
@@ -230,6 +252,7 @@ struct EndpointEditorView: View {
     }
 
     private func testConnection() {
+        guard outputTokenLimit.isValid else { return }
         testResult = nil
         fetchedModels = []
         useCustomModel = false

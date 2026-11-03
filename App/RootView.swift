@@ -8,6 +8,14 @@ struct RootView: View {
         case settings
     }
 
+    init() {
+        #if DEBUG
+        if ScreenshotPreview.screen == "settings" {
+            _selection = State(initialValue: .settings)
+        }
+        #endif
+    }
+
     var body: some View {
         TabView(selection: $selection) {
             ConversationsView()

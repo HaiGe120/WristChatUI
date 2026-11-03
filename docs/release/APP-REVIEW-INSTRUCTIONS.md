@@ -11,12 +11,13 @@ Use the review connection supplied privately in App Store Connect, or a compatib
 ## iPhone walkthrough
 
 1. Open Settings → Endpoints and add the review connection's name, base URL, API format and model. Enter its own API key if required. Test connection & load models can retrieve the model list when the server exposes one. Save and set it active.
-2. Return to Chats and create a conversation. The Chats/Settings bottom tabs disappear while the conversation is open and return when navigating back.
+2. Return to Chats and create a conversation. Compact layouts hide the tab bar while the conversation is open. Wider layouts show the conversation list beside the selected chat and preserve access to the tabs. On iPhone Duo, fold, unfold and rotate while composing; the selected conversation, unsent draft and search choice remain available.
 3. Send an ordinary question with Web search off. Observe incremental reply text.
 4. Enable Web search and ask a question requiring current information. With Native selected, a supported model decides whether to use its server tool. “Web search used” is shown only after reported search activity/retrieval; a supported native model can also choose not to search. Source details and links appear when returned by the service.
 5. In Settings → Search sources, optionally test a separately supplied MiniMax plan source or remote HTTPS MCP service. For MCP, list tools, select the search tool, choose its question field and supply required fixed arguments. The selected source receives the question; the selected chat model receives the references. This is optional setup, not required for ordinary chat.
 6. Start a reply, select Stop, and verify the composer is released. If a connection genuinely fails, the response is marked failed/partial and Retry reuses the original user turn; requests are not silently replayed.
 7. Back Up to iCloud and Restore from iCloud are optional controls for conversation JSON, including compact source metadata but no credentials from secure key fields.
+8. Open Settings → Voice to grant microphone/speech access, dictate a question and use Read reply on a completed answer. Automatic playback is off by default. CarPlay is not enabled in this distribution.
 
 ## Apple Watch walkthrough
 

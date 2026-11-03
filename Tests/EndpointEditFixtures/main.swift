@@ -33,4 +33,17 @@ let editedLegacy = EndpointProfileEdit(legacy).applying(to: legacy)!
 check(editedLegacy.chatCompletionsURL() == legacy.chatCompletionsURL(), "Editing keeps the legacy custom-root path policy")
 var invalid = EndpointProfileEdit(original); invalid.model = " \n "
 check(!invalid.hasRequiredFields, "Whitespace model cannot enable Save")
+let emptyLimit = OutputTokenLimitEdit("")
+check(emptyLimit.isValid && emptyLimit.value == nil, "Empty output limit keeps the API's default behavior")
+let whitespaceLimit = OutputTokenLimitEdit(" \n ")
+check(whitespaceLimit.isValid && whitespaceLimit.value == nil, "Whitespace output limit remains optional")
+let preservedLimit = OutputTokenLimitEdit(original.maxTokens.map(String.init) ?? "")
+check(preservedLimit.isValid && preservedLimit.value == original.maxTokens, "An untouched explicit output limit survives the editor")
+let expandedLimit = OutputTokenLimitEdit(" 4096 ")
+check(expandedLimit.isValid && expandedLimit.value == 4096, "Positive whole-number limits are accepted with surrounding whitespace")
+check(OutputTokenLimitEdit("0008").value == 8, "Leading zeroes retain the positive whole-number value")
+check(OutputTokenLimitEdit(String(Int.max)).value == Int.max, "Validation accepts representable positive integers without a silent cap")
+for value in ["0", "-1", "+1", "1.5", "1e3", "1 024", "abc", String(Int.max) + "0"] {
+    check(!OutputTokenLimitEdit(value).isValid, "Invalid or overflowing output limit must disable Save and connection testing: \(value)")
+}
 print("Endpoint edit fixtures passed: \(checks)")

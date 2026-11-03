@@ -135,6 +135,7 @@ public struct OpenAIStreamDecoder {
     private var textByPart: [String: String] = [:]
     private var partStarts: [String: Int] = [:]
     private var outputCount = 0
+    private var displayedTextSuffix = ""
     private var citationIDs: Set<String> = []
     private var searchStarted = false
     public init(format: APIFormat) { self.format = format }
@@ -162,10 +163,12 @@ public struct OpenAIStreamDecoder {
         let ci = obj["content_index"] as? Int ?? 0
         let key = "\(oi):\(ci)"
         switch type {
+        case "response.reasoning_text.delta", "response.reasoning_summary_text.delta":
+            if let delta = obj["delta"] as? String, !delta.isEmpty { out.append(.processing) }
         case "response.output_text.delta", "response.refusal.delta":
             if let delta = obj["delta"] as? String, !delta.isEmpty {
-                if partStarts[key] == nil { partStarts[key] = outputCount }
-                textByPart[key, default: ""] += delta; outputCount += delta.utf16.count; out.append(.text(delta))
+                textByPart[key, default: ""] += delta
+                appendText(delta, key: key, to: &out)
             }
         case "response.output_text.done", "response.refusal.done":
             appendFinal(obj["text"] as? String ?? obj["refusal"] as? String, key: key, to: &out)
@@ -180,14 +183,17 @@ public struct OpenAIStreamDecoder {
             if let item = obj["item"] as? [String: Any] { try consumeItem(item, index: oi, final: type.hasSuffix("done"), to: &out) }
         case "response.completed":
             let response = obj["response"] as? [String: Any] ?? obj
-            guard response["status"] as? String == nil || response["status"] as? String == "completed" else { throw APIError.incompleteStream }
+            guard response["status"] as? String == nil || response["status"] as? String == "completed" else {
+                throw Self.incompleteError(response)
+            }
             if let items = response["output"] as? [[String: Any]] {
                 for (index, item) in items.enumerated() { try consumeItem(item, index: index, final: true, to: &out) }
             }
             completed = true; out.append(.completed)
         case "response.failed":
             throw Self.streamError(obj["response"] as? [String: Any] ?? obj)
-        case "response.incomplete", "response.cancelled": throw APIError.incompleteStream
+        case "response.incomplete": throw Self.incompleteError(obj["response"] as? [String: Any] ?? obj)
+        case "response.cancelled": throw APIError.incompleteStream
         default: break
         }
         return out
@@ -218,25 +224,48 @@ public struct OpenAIStreamDecoder {
         if text.hasPrefix(delivered) {
             let suffix = String(text.dropFirst(delivered.count))
             if !suffix.isEmpty {
-                if partStarts[key] == nil { partStarts[key] = outputCount }
-                outputCount += suffix.utf16.count; out.append(.text(suffix))
+                appendText(suffix, key: key, to: &out)
             }
         }
         // A differing snapshot must not corrupt an answer already emitted to the UI.
         textByPart[key] = text
     }
 
+    private mutating func appendText(_ text: String, key: String, to out: inout [ProviderStreamEvent]) {
+        if partStarts[key] == nil {
+            if format == .responses, outputCount > 0 {
+                let trailing = displayedTextSuffix.reversed().prefix(while: { $0 == "\n" }).count
+                let leading = text.prefix(while: { $0 == "\n" }).count
+                let separator = String(repeating: "\n", count: max(0, 2 - trailing - leading))
+                if !separator.isEmpty {
+                    outputCount += separator.utf16.count
+                    displayedTextSuffix = String((displayedTextSuffix + separator).suffix(2))
+                    out.append(.text(separator))
+                }
+            }
+            // Citation offsets are local to the API text part. Its displayed base is
+            // after any paragraph separator, including UTF-16 units for earlier emoji.
+            partStarts[key] = outputCount
+        }
+        outputCount += text.utf16.count
+        displayedTextSuffix = String((displayedTextSuffix + text).suffix(2))
+        out.append(.text(text))
+    }
+
     private mutating func chat(_ obj: [String: Any]) throws -> [ProviderStreamEvent] {
         var out: [ProviderStreamEvent] = []
         guard let choices = obj["choices"] as? [[String: Any]], let first = choices.first else { return [] }
         let part = first["delta"] as? [String: Any] ?? first["message"] as? [String: Any] ?? [:]
+        if first["delta"] != nil, let reasoning = part["reasoning_content"] as? String, !reasoning.isEmpty {
+            out.append(.processing)
+        }
         if let text = part["content"] as? String, !text.isEmpty {
             if first["delta"] != nil { textByPart["chat", default: ""] += text; out.append(.text(text)) }
             else { appendFinal(text, key: "chat", to: &out) }
         }
         for annotation in part["annotations"] as? [[String: Any]] ?? [] { appendCitation(annotation, baseOffset: 0, to: &out) }
         if let reason = first["finish_reason"] as? String {
-            if reason == "length" { throw APIError.incompleteStream }
+            if reason == "length" { throw APIError.outputLimitReached }
             if reason == "tool_calls" || reason == "function_call" { throw APIError.unsupportedInteraction("This response requires a tool that has not been configured.") }
             completed = true; out.append(.completed)
         }
@@ -262,7 +291,17 @@ public struct OpenAIStreamDecoder {
         if code.contains("auth") || code.contains("invalid_api_key") { return .authentication }
         if code.contains("rate_limit") || code.contains("quota") { return .quota }
         let body = (try? JSONSerialization.data(withJSONObject: ["error": error])).flatMap { String(data: $0, encoding: .utf8) } ?? ""
-        if case .unsupportedTool(let text) = APIError.response(status: 400, body: body) { return .unsupportedTool(text) }
+        let classified = APIError.response(status: 400, body: body)
+        switch classified {
+        case .unsupportedTool, .searchLimitReached, .contextLimitReached, .outputLimitReached: return classified
+        default: break
+        }
         return .server("Stream error")
+    }
+
+    private static func incompleteError(_ response: [String: Any]) -> APIError {
+        let reason = (response["incomplete_details"] as? [String: Any])?["reason"] as? String
+        if reason == "max_output_tokens" { return .outputLimitReached }
+        return .incompleteStream
     }
 }
